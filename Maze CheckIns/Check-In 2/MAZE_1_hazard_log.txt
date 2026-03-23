@@ -1,0 +1,5 @@
+Hazard Maze Report:
+Step   0: Agent at (511, 0) (No Hazards)
+Step  50: Agent at (492, 31) (No Hazards)
+Step 100: Agent at (463, 52) (No Hazards)
+Step 150: Agent at (470, 95) (No Hazards)
