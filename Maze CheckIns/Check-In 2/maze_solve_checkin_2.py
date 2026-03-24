@@ -3,6 +3,7 @@ import numpy as np
 from collections import deque
 from pathlib import Path # for renaming the file
 from scipy import ndimage # for connected component analysis
+import time # for timing the hazard maze
 
 # Image loaded here. change: Path("<file path>") to the maze image file.
 input_path = Path("./MAZE_1.png")
@@ -186,14 +187,20 @@ if len(GREEN_SOURCES) >= 2: TELEPORT_PAIRS[GREEN_SOURCES[0]] = GREEN_SOURCES[1]
 if len(PURPLE_SOURCES) >= 2: TELEPORT_PAIRS[PURPLE_SOURCES[0]] = PURPLE_SOURCES[1]
 if len(YELLOW_SOURCES) >= 2: TELEPORT_PAIRS[YELLOW_SOURCES[0]] = YELLOW_SOURCES[1]
 
+# For a cleaner output
+def clear_coordinates(coordinate_list):
+    return [(int(x), int(y)) for (x, y) in coordinate_list]
+
 # Prints the detected hazards for debugging purposes.
 print("\nHazard Detection Summary:")
-print(f"Death pits: 🔥:{len(DEATH_PIT_CELLS)}") # found -> {DEATH_PIT_CELLS}
+print("-"*25)
+print("**Note: Coordinates are (x,y)!")
+print(f"Death pits: 🔥:{len(DEATH_PIT_CELLS)} found -> {clear_coordinates(DEATH_PIT_CELLS)}")
 print(f"Confusion traps: 😵:{len(CONFUSION_TRAP_CELLS)}")
 print(f"Green teleport sources: 🟢:{len(GREEN_SOURCES)}")
 print(f"Purple teleport sources: 🟣:{len(PURPLE_SOURCES)}")
 print(f"Yellow teleport sources: 🟡:{len(YELLOW_SOURCES)}")
-print(f"Teleport pairs: {TELEPORT_PAIRS}")
+print(f"Teleport pairs: {len(TELEPORT_PAIRS)} -> {clear_coordinates(TELEPORT_PAIRS)}")
 
 # Defines the path through BFS again
 def near_cell(pos, cell_list, tolerance=8):
@@ -225,6 +232,8 @@ rotation_labels = ["North", "East", "South", "West"]
 print("\n" + "-"*50)
 print("Hazard Maze")
 print("-"*50)
+
+start_time = time.time() # Starts the timer
 
 for step_num, step in enumerate(path):
     for cell in DEATH_PIT_CELLS:
@@ -282,15 +291,19 @@ for step_num, step in enumerate(path):
     if step_num % 50 == 0:
         action_log.append(f"Step {step_num:>3}: Agent at {agent_pos} (No Hazards)")
 
+end_time = time.time() # Stops the timer
+elapsed = round(end_time - start_time, 4)
+
 print("\n" + "-"*50)
 print( "Maze Complete! Hazard maze Summary:")
 print("\n")
-print(f"Total Steps Taken: {len(path)}")
+print(f"Total Steps Taken (Iterations): {len(path)}")
 print(f"Total Deaths: {death_count}")
 print(f"Total Teleports: {teleport_log}")
 print(f"Total Confusion Hits: {confusion_log}")
 print(f"Total Wall Hits: {wall_hits}")
 print(f"Agent's Final Pos: {agent_pos}")
+print(f"Time Elapsed: {elapsed} seconds")
 print("\n")
 
 # Hazard Overlay image
@@ -337,5 +350,6 @@ with open(log_path, "w") as f:
     f.write(f"TELEPORTS: {teleport_log}")
     f.write(f"CONFUSION HITS: {confusion_log}")
     f.write(f"WALL HITS: {wall_hits}\n")
+    f.write(f"TIME ELAPSED: {elapsed}\n")
     
 print(f"\n" + "Hazard event log saved as {log_path}")"""""
