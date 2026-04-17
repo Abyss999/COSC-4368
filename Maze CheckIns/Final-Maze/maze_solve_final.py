@@ -28,6 +28,7 @@ import numpy as np
 from collections import deque, defaultdict, namedtuple
 from pathlib import Path
 from scipy import ndimage
+import hashlib, pickle
 import random
 import time
 
@@ -70,9 +71,9 @@ R_CONFUSION =   -5
 
 # ── Maze file paths (relative to this script) ─────────────────────────────────
 _HERE      = Path(__file__).resolve().parent
-MAZE_ALPHA = _HERE / "Contexts/maze-alpha/MAZE_1.png"
-MAZE_BETA  = _HERE / "Contexts/maze-beta/MAZE_1.png"
-MAZE_GAMMA = _HERE / "Contexts/maze-gamma/MAZE_1.png"
+MAZE_ALPHA = _HERE / "Contexts/maze-alpha/NewMaze_1.png"
+MAZE_BETA  = _HERE / "Contexts/maze-beta/NewMaze_1.png"
+MAZE_GAMMA = _HERE / "Contexts/maze-gamma/NewMaze_1.png"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  NAMED TUPLES
@@ -216,50 +217,57 @@ def cell_to_px(cx: int, cy: int, cs: int) -> tuple:
     return cx * cs + cs // 2, cy * cs + cs // 2
 
 
-def _build_adjacency(pg, w: int, h: int, cs: int) -> dict:
-    """
-    Precompute {cell: {action: neighbour_cell}} using boundary-scan pixel checks.
-    A move (cx,cy)→(nx,ny) is legal when:
-      - both cell centres are FREE, AND
-      - at least one pixel along the shared boundary edge is FREE.
-    """
-    adj: dict = {}
+def _build_adjacency(pg, w, h, cs):
+    adj = {}
+    free_centres = set()
     for cy in range(NUM_CELLS):
         for cx in range(NUM_CELLS):
-            nbrs: dict = {}
-            for act, (dx, dy) in DELTAS.items():
-                if act == WAIT:
-                    continue
-                nx, ny = cx + dx, cy + dy
-                if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
-                    continue
-                c1x = cx * cs + cs // 2
-                c1y = cy * cs + cs // 2
-                c2x = nx * cs + cs // 2
-                c2y = ny * cs + cs // 2
-                # Both cell centres must be free
-                if pg[min(c1y, h - 1), min(c1x, w - 1)] != FREE:
-                    continue
-                if pg[min(c2y, h - 1), min(c2x, w - 1)] != FREE:
-                    continue
-                # Scan the shared boundary for any free passage pixel
-                if dx == 1:
-                    bx = min((cx + 1) * cs, w - 1)
-                    has_free = np.any(pg[cy * cs:min((cy + 1) * cs, h), bx] == FREE)
-                elif dx == -1:
-                    bx = min(cx * cs, w - 1)
-                    has_free = np.any(pg[cy * cs:min((cy + 1) * cs, h), bx] == FREE)
-                elif dy == 1:
-                    by = min((cy + 1) * cs, h - 1)
-                    has_free = np.any(pg[by, cx * cs:min((cx + 1) * cs, w)] == FREE)
-                else:  # dy == -1
-                    by = min(cy * cs, h - 1)
-                    has_free = np.any(pg[by, cx * cs:min((cx + 1) * cs, w)] == FREE)
-                if has_free:
-                    nbrs[act] = (nx, ny)
-            adj[(cx, cy)] = nbrs
+            c1x = min(cx * cs + cs // 2, w - 1)
+            c1y = min(cy * cs + cs // 2, h - 1)
+            if pg[c1y, c1x] == FREE:
+                free_centres.add((cx, cy))
+
+    for (cx, cy) in free_centres:
+        nbrs = {}
+        for act, (dx, dy) in DELTAS.items():
+            if act == WAIT:
+                continue
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
+                continue
+            if (nx, ny) not in free_centres:
+                continue
+            # Boundary slice - precomputed once per direction
+            if dx == 1:
+                x1 = min(cx * cs + cs // 2, w - 1)
+                x2 = min(nx * cs + cs // 2, w - 1)
+                has_free = np.any(pg[cy*cs : min((cy+1)*cs, h), x1:x2+1] == FREE)
+            elif dx == -1:
+                x1 = min(nx * cs + cs // 2, w - 1)
+                x2 = min(cx * cs + cs // 2, w - 1)
+                has_free = np.any(pg[cy*cs : min((cy+1)*cs, h), x1:x2+1] == FREE)
+            elif dy == 1:
+                # Scan the full vertical span between the two cell centres
+                y1 = min(cy * cs + cs // 2, h - 1)
+                y2 = min(ny * cs + cs // 2, h - 1)
+                has_free = np.any(pg[y1:y2+1, cx*cs : min((cx+1)*cs, w)] == FREE)
+            else:  # dy == -1
+                y1 = min(ny * cs + cs // 2, h - 1)
+                y2 = min(cy * cs + cs // 2, h - 1)
+                has_free = np.any(pg[y1:y2+1, cx*cs : min((cx+1)*cs, w)] == FREE)
+            if has_free:
+                nbrs[act] = (nx, ny)
+        adj[(cx, cy)] = nbrs
     return adj
 
+def _build_adjacency_cached(pg, w, h, cs, path):
+    cache_key = hashlib.md5(pg.tobytes()).hexdigest()
+    cache_file = path.parent / f".adj_cache_{cache_key}.pkl"
+    if cache_file.exists():
+        return pickle.loads(cache_file.read_bytes())
+    adj = _build_adjacency(pg, w, h, cs)
+    cache_file.write_bytes(pickle.dumps(adj))
+    return adj
 
 def _rotate_90cw(x: float, y: float, px: float, py: float):
     """Rotate point (x, y) 90° clockwise around pivot (px, py)."""
@@ -285,6 +293,7 @@ class MazeEnvironment:
         self._cs  = _cell_size(w, h)
         self._pg  = _pixel_grid(px, h, w)
         self._adj = _build_adjacency(self._pg, w, h, self._cs)
+        
         self._gamma = is_gamma
 
         # Start / goal
@@ -526,7 +535,7 @@ class QLearningAgent:
         self._hint   = free_cells_hint   # updated when maze is loaded
 
         # ── Persistent across all episodes ───────────────────────────────────
-        self.q_table: dict   = defaultdict(lambda: np.zeros(NUM_ACTIONS, float))
+        self.q_table = np.zeros((NUM_CELLS, NUM_CELLS, 2, NUM_ACTIONS), dtype=np.float32)
         # known_map: visited free/special cells only (no "wall" entries)
         self.known_map: dict = {}       # (cx,cy) → "free"|"death"|
                                         #           "confusion"|"teleport"|"goal"
@@ -543,6 +552,8 @@ class QLearningAgent:
         self.best_turns: int        = 999_999
 
         # ── Per-episode (reset each call to reset_episode) ───────────────────
+        self._frontier_cache     = None
+        self._map_size_at_cache  = 0
         self._pos:       tuple = (0, 0)
         self._confused:  bool  = False
         self._ep_path:   list  = []
@@ -634,6 +645,17 @@ class QLearningAgent:
         return out
 
     def _find_nearest_frontier(self, pos: tuple):
+        current_size = len(self.known_map)
+        if (self._frontier_cache is not None
+                and self._frontier_cache[0] == pos
+                and self._map_size_at_cache == current_size):
+            return self._frontier_cache[1]
+        result = self._find_nearest_frontier_uncached(pos)
+        self._frontier_cache = (pos, result)
+        self._map_size_at_cache = current_size
+        return result
+
+    def _find_nearest_frontier_uncached(self, pos: tuple):
         """
         BFS strictly through known (non-wall, non-danger) cells to find the
         nearest cell that has an undiscovered neighbour reachable via a
@@ -687,13 +709,10 @@ class QLearningAgent:
 
     def update_q(self, prev: tuple, prev_confused: bool,
                  action: int, reward: float, tr: TurnResult):
-        s  = (prev[0], prev[1], int(prev_confused))
-        ns = (tr.current_position[0], tr.current_position[1], int(tr.is_confused))
-        if tr.is_goal_reached:
-            target = reward
-        else:
-            target = reward + GAMMA_RL * float(np.max(self.q_table[ns]))
-        self.q_table[s][action] += ALPHA * (target - float(self.q_table[s][action]))
+        s_q  = self.q_table[prev[0], prev[1], int(prev_confused)]
+        ns_q = self.q_table[tr.current_position[0], tr.current_position[1], int(tr.is_confused)]
+        target = reward if tr.is_goal_reached else reward + GAMMA_RL * float(ns_q.max())
+        s_q[action] += ALPHA * (target - float(s_q[action]))
 
     # ── Observation / internal map update ────────────────────────────────────
 
@@ -789,6 +808,8 @@ def run_episodes(env: MazeEnvironment, agent: QLearningAgent,
     for ep in range(n):
         pos = env.reset(ep)
         agent.reset_episode(pos)
+        agent.reset_episode(pos)
+                
         agent._hint = env.num_free_cells
 
         for turn in range(MAX_TURNS):
@@ -1052,7 +1073,7 @@ def main():
 
     # ── 2. TEST maze-alpha (transfer Q-table + map; no new training) ─────────
     agent_at           = QLearningAgent()
-    agent_at.q_table   = agent_train.q_table
+    agent_at.q_table   = agent_train.q_table.copy()
     agent_at.known_map = dict(agent_train.known_map)
     agent_at._danger   = set(agent_train._danger)
     agent_at._goal_cell  = agent_train._goal_cell
