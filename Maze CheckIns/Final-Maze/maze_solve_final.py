@@ -35,7 +35,7 @@ import time
 # ═════════════════════════════════════════════════════════════════════════════
 #  TUNABLE PARAMETERS  ← change these freely
 # ═════════════════════════════════════════════════════════════════════════════
-TRAIN_EPISODES = 100      # episodes to train on maze-alpha
+TRAIN_EPISODES = 200      # episodes to train on maze-alpha
 TEST_EPISODES  = 5        # evaluation episodes per maze
 MAX_TURNS      = 10_000   # per-episode turn limit (spec max)
 
