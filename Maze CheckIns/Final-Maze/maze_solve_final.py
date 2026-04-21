@@ -18,7 +18,8 @@ Flow:
 
 Metrics reported
   Primary : success rate, avg path length, avg turns to solution, death rate
-  Bonus   : exploration efficiency, map completeness, learning efficiency
+  Bonus   : exploration efficiency, map completeness, replanning efficiency,
+            learning efficiency
 """
 from __future__ import annotations
 
@@ -71,9 +72,9 @@ R_CONFUSION =   -5
 
 # ── Maze file paths (relative to this script) ─────────────────────────────────
 _HERE      = Path(__file__).resolve().parent
-MAZE_ALPHA = _HERE / "Contexts/maze-alpha/NewMaze_1.png"
-MAZE_BETA  = _HERE / "Contexts/maze-beta/NewMaze_1.png"
-MAZE_GAMMA = _HERE / "Contexts/maze-gamma/NewMaze_1.png"
+MAZE_ALPHA = _HERE / "Contexts/maze-alpha/MAZE_1.png"
+MAZE_BETA  = _HERE / "Contexts/maze-beta/MAZE_1.png"
+MAZE_GAMMA = _HERE / "Contexts/maze-gamma/MAZE_1.png"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  NAMED TUPLES
@@ -192,6 +193,11 @@ def _detect_hazards(pixels, h, w) -> dict:
     mid_y    = h // 2
     push_up  = [(x, y) for x, y in all_blue if y < mid_y]
     push_lft = [(x, y) for x, y in all_blue if y >= mid_y]
+
+    if all_blue and not push_up:
+        print("  [warn] No push_up pads detected in upper half")
+    if all_blue and not push_lft:
+        print("  [warn] No push_left pads detected in lower half")
 
     return dict(
         fire       = fire,
@@ -543,17 +549,24 @@ class QLearningAgent:
         self._blocked: set  = set()
         self._danger: set   = set()     # cells known to be lethal
         self._tele_map: dict = {}        # pad_cell → dest_cell (inferred from TurnResult)
-        self._rot_danger: dict = {0: set(), 1: set(), 2: set(), 3: set()}  # ep%4 → known fire pits
-        self._ep_count: int = 0          # total episodes seen (drives fire rotation inference)
+        self._rot_danger: dict = {0: set(), 1: set(), 2: set(), 3: set()}
+        self._ep_count: int = 0
+        self._ep_turn_count: int = 0     # turns within current episode (drives fire rotation)
         self._goal_cell: tuple | None  = None
         self._start_cell: tuple | None = None
+
+        # Replanning efficiency (accumulate across all episodes in a phase)
+        self._replan_attempts:  int = 0
+        self._replan_successes: int = 0
 
         self.best_path: list | None = None
         self.best_turns: int        = 999_999
 
         # ── Per-episode (reset each call to reset_episode) ───────────────────
-        self._frontier_cache     = None
-        self._map_size_at_cache  = 0
+        self._frontier_cache      = None
+        self._map_size_at_cache   = 0
+        self._goal_path_cache: list | None = None   # cached BFS path to goal
+        self._goal_cache_key: tuple | None = None   # (pos, danger_hash, map_len)
         self._pos:       tuple = (0, 0)
         self._confused:  bool  = False
         self._ep_path:   list  = []
@@ -564,18 +577,20 @@ class QLearningAgent:
     # ── Episode lifecycle ─────────────────────────────────────────────────────
 
     def reset_episode(self, start: tuple):
-        self._pos       = start
-        self._confused  = False
-        self._ep_path   = [start]
-        self._ep_deaths = 0
-        self._ep_turns  = 0
-        self._ep_cells  = {start}
+        self._pos           = start
+        self._confused      = False
+        self._ep_path       = [start]
+        self._ep_deaths     = 0
+        self._ep_turns      = 0
+        self._ep_turn_count = 0
+        self._ep_cells      = {start}
+        self._goal_path_cache = None
+        self._goal_cache_key  = None
         if self._start_cell is None:
             self._start_cell = start
         self.known_map.setdefault(start, "free")
         self._ep_count += 1
-        rot = self._ep_count % 4
-        self._danger = set(self._rot_danger[rot])  # preload this rotation's known fire pits
+        self._danger = set(self._rot_danger[0])  # episodes always start at rotation 0
 
     # ── Action selection ──────────────────────────────────────────────────────
 
@@ -589,6 +604,10 @@ class QLearningAgent:
         BFS always runs when epsilon does NOT trigger — this ensures the agent
         actually navigates rather than spinning in place once epsilon drops.
         """
+        # Refresh danger for the current fire-rotation slot
+        rot = (self._ep_turn_count // 5) % 4
+        self._danger = set(self._rot_danger[rot])
+
         # ── Small epsilon-random override (prevents loops, handles hazards) ───
         if random.random() < self.epsilon:
             frontier_acts = self._frontier_actions(pos)
@@ -598,12 +617,21 @@ class QLearningAgent:
 
         # ── Deterministic BFS component ───────────────────────────────────────
 
-        # Phase 2: goal found → navigate to it
+        # Phase 2: goal found → navigate to it (with path cache)
         if self._goal_cell is not None:
-            safe = {k: v for k, v in self.known_map.items()
-                    if k not in self._danger}
-            path = _bfs_known(safe, pos, self._goal_cell, self._danger,
-                              blocked=self._blocked, tele_map=self._tele_map)
+            cache_key = (pos, len(self._danger), len(self.known_map))
+            if self._goal_cache_key == cache_key and self._goal_path_cache and len(self._goal_path_cache) > 1:
+                path = self._goal_path_cache
+            else:
+                self._replan_attempts += 1
+                safe = {k: v for k, v in self.known_map.items()
+                        if k not in self._danger}
+                path = _bfs_known(safe, pos, self._goal_cell, self._danger,
+                                  blocked=self._blocked, tele_map=self._tele_map)
+                self._goal_path_cache = path
+                self._goal_cache_key  = cache_key
+                if len(path) > 1:
+                    self._replan_successes += 1
             if len(path) > 1:
                 return self._delta_to_action(pos, path[1])
 
@@ -719,18 +747,20 @@ class QLearningAgent:
     def observe(self, prev: tuple, action: int, tr: TurnResult):
         """Update internal map and per-episode stats from TurnResult."""
         cur = tr.current_position
-        self._ep_turns += 1
+        self._ep_turns      += 1
+        self._ep_turn_count += 1
+        rot = (self._ep_turn_count // 5) % 4
+        self._danger = set(self._rot_danger[rot])
 
         if tr.is_dead:
-            # The cell we stepped INTO was a fire pit.
-            # Infer its location from prev + action direction.
+            # Infer the fire pit location from prev + action direction.
             if tr.wall_hits == 0:
                 dx, dy  = DELTAS.get(action, (0, 0))
                 pit_loc = (prev[0] + dx, prev[1] + dy)
                 if 0 <= pit_loc[0] < NUM_CELLS and 0 <= pit_loc[1] < NUM_CELLS:
                     self.known_map[pit_loc] = "death"
                     self._danger.add(pit_loc)
-                    self._rot_danger[self._ep_count % 4].add(pit_loc)
+                    self._rot_danger[rot].add(pit_loc)
             self._ep_deaths += 1
             self._pos      = self._start_cell if self._start_cell else cur
             self._confused = False
@@ -877,6 +907,7 @@ def report_metrics(stats: list, agent: QLearningAgent,
            if stats else 0.0)
     MC  = (len([v for v in agent.known_map.values() if v != "wall"])
            / env.num_free_cells)
+    RE  = agent._replan_successes / max(1, agent._replan_attempts)
 
     # Learning efficiency: first episode where rolling-10 SR ≥ 80 %
     LE_ep = None
@@ -897,13 +928,14 @@ def report_metrics(stats: list, agent: QLearningAgent,
     print(f"  Death Rate              : {DR:>8.4f}   (target <0.05)")
     print(f"  [Bonus] Exploration Eff.: {EE:.4f}")
     print(f"  [Bonus] Map Completeness: {MC:.1%}")
+    print(f"  [Bonus] Replanning Eff. : {RE:.4f}  ({agent._replan_successes}/{agent._replan_attempts} BFS calls succeeded)")
     if LE_ep is not None:
         print(f"  [Bonus] Learning Eff.   : converged at episode {LE_ep}")
     elif train_stats:
         print(f"  [Bonus] Learning Eff.   : did not reach 80 % SR during training")
     print(f"{'─'*54}")
 
-    return dict(SR=SR, APL=APL, AT=AT, DR=DR, EE=EE, MC=MC, LE=LE_ep)
+    return dict(SR=SR, APL=APL, AT=AT, DR=DR, EE=EE, MC=MC, RE=RE, LE=LE_ep)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1024,6 +1056,7 @@ def run_maze_phase(
         label: str,
         is_gamma: bool = False,
         train_stats_for_LE: list | None = None,
+        out_dir: Path | None = None,
 ) -> tuple:
     """Load maze, run episodes, report metrics, save output images."""
     print(f"\n{'═'*55}")
@@ -1032,18 +1065,22 @@ def run_maze_phase(
 
     env = MazeEnvironment(maze_path, is_gamma=is_gamma)
     agent._hint = env.num_free_cells
+    agent._replan_attempts  = 0
+    agent._replan_successes = 0
 
     stats   = run_episodes(env, agent, n_ep, train=train, label=label)
     metrics = report_metrics(stats, agent, env, label,
                              train_stats=train_stats_for_LE)
 
-    stem = maze_path.stem
-    tag  = "train" if train else "test"
+    stem     = maze_path.stem
+    ctx      = maze_path.parent.name          # e.g. "maze-alpha"
+    tag      = "train" if train else "test"
+    save_dir = out_dir if out_dir is not None else maze_path.parent
     if agent.best_path:
         _save_path_image(env, agent.best_path,
-                         maze_path.parent / f"{stem}_rl_{tag}_solved.png")
+                         save_dir / f"{stem}_{ctx}_rl_{tag}_solved.png")
     _save_map_overlay(env, agent,
-                      maze_path.parent / f"{stem}_rl_{tag}_map.png")
+                      save_dir / f"{stem}_{ctx}_rl_{tag}_map.png")
 
     return stats, metrics, env
 
@@ -1063,13 +1100,16 @@ def main():
 
     t0 = time.time()
 
+    RESULTS_DIR = _HERE / "Results"
+    RESULTS_DIR.mkdir(exist_ok=True)
+
     # ── 1. TRAIN on maze-alpha ────────────────────────────────────────────────
     agent_train = QLearningAgent()
     train_stats, _, _ = run_maze_phase(
         MAZE_ALPHA, agent_train, TRAIN_EPISODES,
-        train=True, label="MAZE-ALPHA  Training")
+        train=True, label="MAZE-ALPHA  Training", out_dir=RESULTS_DIR)
 
-    _save_learning_curve(train_stats, _HERE / "learning_curve_alpha.png")
+    _save_learning_curve(train_stats, RESULTS_DIR / "learning_curve_alpha.png")
 
     # ── 2. TEST maze-alpha (transfer Q-table + map; no new training) ─────────
     agent_at           = QLearningAgent()
@@ -1087,25 +1127,49 @@ def main():
     test_a_stats, test_a_m, _ = run_maze_phase(
         MAZE_ALPHA, agent_at, TEST_EPISODES,
         train=False, label="MAZE-ALPHA  Test (no retraining)",
-        train_stats_for_LE=train_stats)
+        train_stats_for_LE=train_stats, out_dir=RESULTS_DIR)
 
-    # ── 3. TEST maze-beta (fresh agent — zero-shot, no training) ─────────────
-    agent_b          = QLearningAgent()
-    agent_b.epsilon  = 0.80   # start with high exploration; decays each episode
+    # ── 3. TEST maze-beta (warm-start from alpha; no Q-update, no training) ─────
+    # Goal is at the same position in all mazes. Pre-seeding it lets BFS route
+    # directly to the goal from episode 1 instead of exploring blindly.
+    # Fire pit positions differ in beta, so danger/rot_danger are cleared.
+    agent_b             = QLearningAgent()
+    agent_b.q_table     = agent_train.q_table.copy()
+    agent_b.known_map   = {k: v for k, v in agent_train.known_map.items()
+                           if v != "death"}
+    agent_b._goal_cell  = agent_train._goal_cell
+    agent_b._start_cell = agent_train._start_cell
+    agent_b._tele_map   = dict(agent_train._tele_map)
+    agent_b._blocked    = set(agent_train._blocked)
+    agent_b._danger     = set()
+    agent_b._rot_danger = {0: set(), 1: set(), 2: set(), 3: set()}
+    agent_b.epsilon     = EPS_END   # map + goal already known; exploit learned policy
+
     test_b_stats, test_b_m, _ = run_maze_phase(
         MAZE_BETA, agent_b, TEST_EPISODES,
-        train=False, label="MAZE-BETA  Test (zero-shot, no training)")
+        train=False, label="MAZE-BETA  Test (zero-shot, no training)",
+        out_dir=RESULTS_DIR)
 
     # ── 4. EXTRA CREDIT — maze-gamma ─────────────────────────────────────────
     print(f"\n{'═'*55}")
     print("  EXTRA CREDIT: Maze-Gamma (directional push-pad hazards ⬆️⬅️)")
     print(f"{'═'*55}")
-    agent_g          = QLearningAgent()
-    agent_g.epsilon  = 0.80
+    agent_g             = QLearningAgent()
+    agent_g.q_table     = agent_train.q_table.copy()
+    agent_g.known_map   = {k: v for k, v in agent_train.known_map.items()
+                           if v != "death"}
+    agent_g._goal_cell  = agent_train._goal_cell
+    agent_g._start_cell = agent_train._start_cell
+    agent_g._tele_map   = dict(agent_train._tele_map)
+    agent_g._blocked    = set(agent_train._blocked)
+    agent_g._danger     = set()
+    agent_g._rot_danger = {0: set(), 1: set(), 2: set(), 3: set()}
+    agent_g.epsilon     = EPS_END
+
     test_g_stats, test_g_m, _ = run_maze_phase(
         MAZE_GAMMA, agent_g, TEST_EPISODES,
         train=False, label="MAZE-GAMMA  Extra Credit (zero-shot)",
-        is_gamma=True)
+        is_gamma=True, out_dir=RESULTS_DIR)
 
     # ── Final summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t0

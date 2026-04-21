@@ -71,9 +71,9 @@ R_CONFUSION =   -5
 
 # ── Maze file paths (relative to this script) ─────────────────────────────────
 _HERE      = Path(__file__).resolve().parent
-MAZE_ALPHA = _HERE / "Contexts/maze-alpha/NewMaze_1.png"
-MAZE_BETA  = _HERE / "Contexts/maze-beta/NewMaze_1.png"
-MAZE_GAMMA = _HERE / "Contexts/maze-gamma/NewMaze_1.png"
+MAZE_ALPHA = _HERE / "Contexts/maze-alpha/MAZE_1.png"
+MAZE_BETA  = _HERE / "Contexts/maze-beta/MAZE_1.png"
+MAZE_GAMMA = _HERE / "Contexts/maze-gamma/MAZE_1.png"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  NAMED TUPLES
@@ -235,27 +235,29 @@ def _build_adjacency(pg, w, h, cs):
             nx, ny = cx + dx, cy + dy
             if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
                 continue
-            if (nx, ny) not in free_centres:
-                continue
-            # Boundary slice - precomputed once per direction
+            # Check BOTH boundary pixels at the seam between cells.
+            # The wall may be drawn on the last pixel of the source cell OR the
+            # first pixel of the dest cell depending on the maze format — checking
+            # both and requiring both FREE handles either case without being
+            # as over-broad as the original center-to-center np.all.
+            half = cs // 2
             if dx == 1:
-                x1 = min(cx * cs + cs // 2, w - 1)
-                x2 = min(nx * cs + cs // 2, w - 1)
-                has_free = np.any(pg[cy*cs : min((cy+1)*cs, h), x1:x2+1] == FREE)
+                row  = min(cy * cs + half, h - 1)
+                pas  = (pg[row, min(cx * cs + cs - 1, w - 1)] == FREE and
+                        pg[row, min((cx + 1) * cs,    w - 1)] == FREE)
             elif dx == -1:
-                x1 = min(nx * cs + cs // 2, w - 1)
-                x2 = min(cx * cs + cs // 2, w - 1)
-                has_free = np.any(pg[cy*cs : min((cy+1)*cs, h), x1:x2+1] == FREE)
+                row  = min(cy * cs + half, h - 1)
+                pas  = (pg[row, max(0, cx * cs - 1)] == FREE and
+                        pg[row, min(cx * cs,    w - 1)] == FREE)
             elif dy == 1:
-                # Scan the full vertical span between the two cell centres
-                y1 = min(cy * cs + cs // 2, h - 1)
-                y2 = min(ny * cs + cs // 2, h - 1)
-                has_free = np.any(pg[y1:y2+1, cx*cs : min((cx+1)*cs, w)] == FREE)
+                col  = min(cx * cs + half, w - 1)
+                pas  = (pg[min(cy * cs + cs - 1, h - 1), col] == FREE and
+                        pg[min((cy + 1) * cs,    h - 1), col] == FREE)
             else:  # dy == -1
-                y1 = min(ny * cs + cs // 2, h - 1)
-                y2 = min(cy * cs + cs // 2, h - 1)
-                has_free = np.any(pg[y1:y2+1, cx*cs : min((cx+1)*cs, w)] == FREE)
-            if has_free:
+                col  = min(cx * cs + half, w - 1)
+                pas  = (pg[max(0, cy * cs - 1), col] == FREE and
+                        pg[min(cy * cs,    h - 1), col] == FREE)
+            if pas:
                 nbrs[act] = (nx, ny)
         adj[(cx, cy)] = nbrs
     return adj
@@ -328,10 +330,12 @@ class MazeEnvironment:
         ))
 
         # Episode state
-        self._ep   = 0
+        self._ep         = 0
+        self._turn_count = 0
         self._pos  = self._start
         self._conf = 0        # confusion turns remaining
         self._fire: frozenset = frozenset()
+        self._rotate_fire(0)
 
         print(
             f"  Loaded {path.name:<22} | "
@@ -347,10 +351,11 @@ class MazeEnvironment:
 
     def reset(self, episode: int | None = None) -> tuple:
         """Reset to start position, rotate fire pits for new episode."""
-        self._ep  = episode if episode is not None else self._ep + 1
-        self._pos = self._start
+        self._ep         = episode if episode is not None else self._ep + 1
+        self._turn_count = 0
+        self._pos  = self._start
         self._conf = 0
-        self._rotate_fire(self._ep)
+        self._rotate_fire(0)
         return self._pos
 
     def step(self, action: int) -> TurnResult:
@@ -358,6 +363,9 @@ class MazeEnvironment:
         wall_hits  = 0
         teleported = False
         pushed     = False
+
+        self._turn_count += 1
+        self._rotate_fire((self._turn_count // 5) % 4)
 
         # Confusion reversal
         eff_action = REVERSE[action] if self._conf > 0 else action
@@ -543,8 +551,9 @@ class QLearningAgent:
         self._blocked: set  = set()
         self._danger: set   = set()     # cells known to be lethal
         self._tele_map: dict = {}        # pad_cell → dest_cell (inferred from TurnResult)
-        self._rot_danger: dict = {0: set(), 1: set(), 2: set(), 3: set()}  # ep%4 → known fire pits
-        self._ep_count: int = 0          # total episodes seen (drives fire rotation inference)
+        self._rot_danger: dict = {0: set(), 1: set(), 2: set(), 3: set()}  # rot slot → known fire pits
+        self._ep_count: int = 0          # total episodes seen
+        self._ep_turn_count: int = 0     # turns taken within current episode (drives rotation slot)
         self._goal_cell: tuple | None  = None
         self._start_cell: tuple | None = None
 
@@ -564,18 +573,18 @@ class QLearningAgent:
     # ── Episode lifecycle ─────────────────────────────────────────────────────
 
     def reset_episode(self, start: tuple):
-        self._pos       = start
-        self._confused  = False
-        self._ep_path   = [start]
-        self._ep_deaths = 0
-        self._ep_turns  = 0
-        self._ep_cells  = {start}
+        self._pos           = start
+        self._confused      = False
+        self._ep_path       = [start]
+        self._ep_deaths     = 0
+        self._ep_turns      = 0
+        self._ep_cells      = {start}
+        self._ep_turn_count = 0
         if self._start_cell is None:
             self._start_cell = start
         self.known_map.setdefault(start, "free")
         self._ep_count += 1
-        rot = self._ep_count % 4
-        self._danger = set(self._rot_danger[rot])  # preload this rotation's known fire pits
+        self._danger = set(self._rot_danger[0])  # episodes always start at rotation 0
 
     # ── Action selection ──────────────────────────────────────────────────────
 
@@ -589,6 +598,9 @@ class QLearningAgent:
         BFS always runs when epsilon does NOT trigger — this ensures the agent
         actually navigates rather than spinning in place once epsilon drops.
         """
+        rot = (self._ep_turn_count // 5) % 4
+        self._danger = set(self._rot_danger[rot])
+
         # ── Small epsilon-random override (prevents loops, handles hazards) ───
         if random.random() < self.epsilon:
             frontier_acts = self._frontier_actions(pos)
@@ -640,7 +652,8 @@ class QLearningAgent:
                 continue
             nb = (cx + dx, cy + dy)
             if (0 <= nb[0] < NUM_CELLS and 0 <= nb[1] < NUM_CELLS
-                    and nb not in self.known_map):
+                    and nb not in self.known_map
+                    and (pos, nb) not in self._blocked):
                 out.append(act)
         return out
 
@@ -719,7 +732,10 @@ class QLearningAgent:
     def observe(self, prev: tuple, action: int, tr: TurnResult):
         """Update internal map and per-episode stats from TurnResult."""
         cur = tr.current_position
-        self._ep_turns += 1
+        self._ep_turns      += 1
+        self._ep_turn_count += 1
+        rot = (self._ep_turn_count // 5) % 4
+        self._danger = set(self._rot_danger[rot])
 
         if tr.is_dead:
             # The cell we stepped INTO was a fire pit.
@@ -730,7 +746,7 @@ class QLearningAgent:
                 if 0 <= pit_loc[0] < NUM_CELLS and 0 <= pit_loc[1] < NUM_CELLS:
                     self.known_map[pit_loc] = "death"
                     self._danger.add(pit_loc)
-                    self._rot_danger[self._ep_count % 4].add(pit_loc)
+                    self._rot_danger[rot].add(pit_loc)
             self._ep_deaths += 1
             self._pos      = self._start_cell if self._start_cell else cur
             self._confused = False
@@ -808,8 +824,6 @@ def run_episodes(env: MazeEnvironment, agent: QLearningAgent,
     for ep in range(n):
         pos = env.reset(ep)
         agent.reset_episode(pos)
-        agent.reset_episode(pos)
-                
         agent._hint = env.num_free_cells
 
         for turn in range(MAX_TURNS):
@@ -1024,6 +1038,7 @@ def run_maze_phase(
         label: str,
         is_gamma: bool = False,
         train_stats_for_LE: list | None = None,
+        out_dir: Path | None = None,
 ) -> tuple:
     """Load maze, run episodes, report metrics, save output images."""
     print(f"\n{'═'*55}")
@@ -1037,13 +1052,15 @@ def run_maze_phase(
     metrics = report_metrics(stats, agent, env, label,
                              train_stats=train_stats_for_LE)
 
-    stem = maze_path.stem
-    tag  = "train" if train else "test"
+    stem     = maze_path.stem
+    ctx      = maze_path.parent.name          # e.g. "maze-alpha"
+    tag      = "train" if train else "test"
+    save_dir = out_dir if out_dir is not None else maze_path.parent
     if agent.best_path:
         _save_path_image(env, agent.best_path,
-                         maze_path.parent / f"{stem}_rl_{tag}_solved.png")
+                         save_dir / f"{stem}_{ctx}_rl_{tag}_solved.png")
     _save_map_overlay(env, agent,
-                      maze_path.parent / f"{stem}_rl_{tag}_map.png")
+                      save_dir / f"{stem}_{ctx}_rl_{tag}_map.png")
 
     return stats, metrics, env
 
@@ -1063,13 +1080,16 @@ def main():
 
     t0 = time.time()
 
+    RESULTS_DIR = _HERE / "Results"
+    RESULTS_DIR.mkdir(exist_ok=True)
+
     # ── 1. TRAIN on maze-alpha ────────────────────────────────────────────────
     agent_train = QLearningAgent()
     train_stats, _, _ = run_maze_phase(
         MAZE_ALPHA, agent_train, TRAIN_EPISODES,
-        train=True, label="MAZE-ALPHA  Training")
+        train=True, label="MAZE-ALPHA  Training", out_dir=RESULTS_DIR)
 
-    _save_learning_curve(train_stats, _HERE / "learning_curve_alpha.png")
+    _save_learning_curve(train_stats, RESULTS_DIR / "learning_curve_alpha.png")
 
     # ── 2. TEST maze-alpha (transfer Q-table + map; no new training) ─────────
     agent_at           = QLearningAgent()
@@ -1087,7 +1107,7 @@ def main():
     test_a_stats, test_a_m, _ = run_maze_phase(
         MAZE_ALPHA, agent_at, TEST_EPISODES,
         train=False, label="MAZE-ALPHA  Test (no retraining)",
-        train_stats_for_LE=train_stats)
+        train_stats_for_LE=train_stats, out_dir=RESULTS_DIR)
 
     # ── 3. TEST maze-beta (warm-start from alpha; no Q-update, no training) ─────
     # Goal is at the same position in all mazes. Pre-seeding it lets BFS route
@@ -1095,19 +1115,25 @@ def main():
     # Fire pit positions differ in beta, so danger/rot_danger are cleared.
     agent_b             = QLearningAgent()
     agent_b.q_table     = agent_train.q_table.copy()
-    agent_b.known_map   = {k: v for k, v in agent_train.known_map.items()
-                           if v != "death"}
+    # Alpha fire cells are "death" in the map, but beta/gamma fire is in different
+    # positions — those cells are safe in beta/gamma and may be the only path to
+    # the goal.  Reclassify them as "free" so BFS can route through them.
+    agent_b.known_map   = {k: ("free" if v == "death" else v)
+                           for k, v in agent_train.known_map.items()}
     agent_b._goal_cell  = agent_train._goal_cell
     agent_b._start_cell = agent_train._start_cell
     agent_b._tele_map   = dict(agent_train._tele_map)
-    agent_b._blocked    = set(agent_train._blocked)
+    # Clear alpha's blocked edges — beta/gamma may have different wall layout;
+    # stale blocked edges would prevent BFS from finding valid paths.
+    agent_b._blocked    = set()
     agent_b._danger     = set()
     agent_b._rot_danger = {0: set(), 1: set(), 2: set(), 3: set()}
     agent_b.epsilon     = 0.15   # map + goal already known; exploit learned policy
 
     test_b_stats, test_b_m, _ = run_maze_phase(
         MAZE_BETA, agent_b, TEST_EPISODES,
-        train=False, label="MAZE-BETA  Test (zero-shot, no training)")
+        train=False, label="MAZE-BETA  Test (zero-shot, no training)",
+        out_dir=RESULTS_DIR)
 
     # ── 4. EXTRA CREDIT — maze-gamma ─────────────────────────────────────────
     print(f"\n{'═'*55}")
@@ -1115,12 +1141,12 @@ def main():
     print(f"{'═'*55}")
     agent_g             = QLearningAgent()
     agent_g.q_table     = agent_train.q_table.copy()
-    agent_g.known_map   = {k: v for k, v in agent_train.known_map.items()
-                           if v != "death"}
+    agent_g.known_map   = {k: ("free" if v == "death" else v)
+                           for k, v in agent_train.known_map.items()}
     agent_g._goal_cell  = agent_train._goal_cell
     agent_g._start_cell = agent_train._start_cell
     agent_g._tele_map   = dict(agent_train._tele_map)
-    agent_g._blocked    = set(agent_train._blocked)
+    agent_g._blocked    = set()
     agent_g._danger     = set()
     agent_g._rot_danger = {0: set(), 1: set(), 2: set(), 3: set()}
     agent_g.epsilon     = 0.15
@@ -1128,7 +1154,7 @@ def main():
     test_g_stats, test_g_m, _ = run_maze_phase(
         MAZE_GAMMA, agent_g, TEST_EPISODES,
         train=False, label="MAZE-GAMMA  Extra Credit (zero-shot)",
-        is_gamma=True)
+        is_gamma=True, out_dir=RESULTS_DIR)
 
     # ── Final summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -1150,8 +1176,8 @@ def main():
         at_s = f"{AT:.0f}" if AT < float("inf") else "N/A"
         print(f"  {lbl:<22} {SR:>6.1%}  {at_s:>9}  {DR:>10.4f}")
     print(f"{'═'*55}\n")
-    print("  Output images saved to each maze's Contexts folder.")
-    print("  Learning curve saved to: learning_curve_alpha.png\n")
+    print("  All output images saved to: Results/")
+    print("  Learning curve saved to: Results/learning_curve_alpha.png\n")
 
 
 if __name__ == "__main__":
