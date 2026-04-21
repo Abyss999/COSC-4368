@@ -1,490 +1,372 @@
 """
-maze_solve_final.py  —  COSC 4368 AI  |  Final Check-In
-Group 5
-
-Method: Tabular Q-Learning with BFS-guided exploration
-
-Why Q-Learning:
-  - State space is tractable: 64×64 cells × 2 (confused flag) = 8 192 states
-  - Off-policy — memory and Q-table persist across episodes (spec permits this)
-  - Handles non-stationary fire rotations naturally via continued Q-updates
-  - No neural network needed; interpretable and easy to demo
+maze_solve_final.py  ·  COSC 4368 AI  ·  Group 5
+Method: Tabular Q-Learning + BFS-guided exploration
 
 Flow:
-  1. Train on maze-alpha  (TRAIN_EPISODES)
-  2. Test  on maze-alpha  (TEST_EPISODES,  no retraining)
-  3. Test  on maze-beta   (TEST_EPISODES,  zero-shot — no training at all)
-  4. Test  on maze-gamma  (TEST_EPISODES,  extra credit — push-pad hazards)
-
-Metrics reported
-  Primary : success rate, avg path length, avg turns to solution, death rate
-  Bonus   : exploration efficiency, map completeness, replanning efficiency,
-            learning efficiency
+  1. Train on maze-alpha
+  2. Test  on maze-alpha  (no retraining)
+  3. Test  on maze-beta   (zero-shot)
+  4. Test  on maze-gamma  (extra credit -- push-pad hazards)
 """
 from __future__ import annotations
 
-# ── Imports ───────────────────────────────────────────────────────────────────
 from PIL import Image, ImageDraw
 import numpy as np
-from collections import deque, defaultdict, namedtuple
+from collections import deque
 from pathlib import Path
 from scipy import ndimage
-import hashlib, pickle
-import random
-import time
+import random, time, hashlib, pickle
+from dataclasses import dataclass
+from typing import Optional
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  TUNABLE PARAMETERS  ← change these freely
-# ═════════════════════════════════════════════════════════════════════════════
-TRAIN_EPISODES = 200      # episodes to train on maze-alpha
-TEST_EPISODES  = 5        # evaluation episodes per maze
-MAX_TURNS      = 10_000   # per-episode turn limit (spec max)
+# ════════════════════════════════════════════════════════
+#  SETTINGS  <- change freely
+# ════════════════════════════════════════════════════════
+PRETRAIN_EPISODES = 100   # blank maze (MAZE_0) warm-up
+TRAIN_EPISODES = 200
+TEST_EPISODES  = 5
+MAX_TURNS      = 10_000
 
-# Q-Learning hyperparameters
-ALPHA     = 0.1           # learning rate
-GAMMA_RL  = 0.95          # discount factor
-EPS_START = 1.0           # initial exploration rate (ε)
-EPS_END   = 0.05          # minimum ε
-EPS_DECAY = 0.95          # multiply ε by this each episode
+LR        = 0.1    # Q-learning rate
+GAMMA_RL  = 0.95   # discount factor
+EPS_START = 1.0    # initial exploration rate
+EPS_END   = 0.05   # minimum exploration rate
+EPS_DECAY = 0.95   # epsilon multiplied by this each episode
 
+R_GOAL     =  200.0
+R_DEATH    =  -50.0
+R_NEW_CELL =   +0.5
+R_STEP     =   -1.0
+R_WALL     =   -2.0
+R_CONFUSED =   -5.0
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  CONSTANTS
-# ═════════════════════════════════════════════════════════════════════════════
-WALL        = 1
-FREE        = 0
-NUM_CELLS   = 64          # maze grid size (spec: 64 × 64)
-BRIGHTNESS  = 128         # pixel-brightness threshold (FREE if > BRIGHTNESS)
+# ════════════════════════════════════════════════════════
+GRID = 64           # cells per side
+FREE, WALL = 0, 1
+BRIGHT = 128        # red-channel threshold: > BRIGHT -> free cell
 
-# Actions
 UP, RIGHT, DOWN, LEFT, WAIT = 0, 1, 2, 3, 4
-NUM_ACTIONS = 5
-DELTAS  = {UP: (0, -1), RIGHT: (1, 0), DOWN: (0, 1), LEFT: (-1, 0), WAIT: (0, 0)}
-REVERSE = {UP: DOWN, DOWN: UP, LEFT: RIGHT, RIGHT: LEFT, WAIT: WAIT}
+N_ACTIONS = 5
+DELTAS  = {UP:(0,-1), RIGHT:(1,0), DOWN:(0,1), LEFT:(-1,0), WAIT:(0,0)}
+REVERSE = {UP:DOWN, DOWN:UP, LEFT:RIGHT, RIGHT:LEFT, WAIT:WAIT}
 
-# Rewards
-R_GOAL      =  200
-R_DEATH     =  -50
-R_NEW_CELL  =  +0.5
-R_STEP      =   -1
-R_WALL_HIT  =   -2
-R_CONFUSION =   -5
+_HERE           = Path(__file__).resolve().parent
+MAZE_ALPHA_BLANK = _HERE / "Contexts/maze-alpha/MAZE_0.png"
+MAZE_ALPHA      = _HERE / "Contexts/maze-alpha/MAZE_1.png"
+MAZE_BETA_BLANK  = _HERE / "Contexts/maze-beta/MAZE_0.png"
+MAZE_BETA       = _HERE / "Contexts/maze-beta/MAZE_1.png"
+MAZE_GAMMA_BLANK = _HERE / "Contexts/maze-gamma/MAZE_0.png"
+MAZE_GAMMA      = _HERE / "Contexts/maze-gamma/MAZE_1.png"
+RESULTS         = _HERE / "Results"
 
-# ── Maze file paths (relative to this script) ─────────────────────────────────
-_HERE      = Path(__file__).resolve().parent
-MAZE_ALPHA = _HERE / "Contexts/maze-alpha/MAZE_1.png"
-MAZE_BETA  = _HERE / "Contexts/maze-beta/MAZE_1.png"
-MAZE_GAMMA = _HERE / "Contexts/maze-gamma/MAZE_1.png"
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  NAMED TUPLES
-# ═════════════════════════════════════════════════════════════════════════════
-TurnResult = namedtuple("TurnResult", [
-    "wall_hits",          # int   – wall collisions this action
-    "current_position",   # (cx, cy) – agent cell after action (respawn if dead)
-    "is_dead",            # bool  – stepped into fire pit
-    "is_confused",        # bool  – confusion flag active now
-    "is_goal_reached",    # bool  – reached goal cell
-    "teleported",         # bool  – teleport was triggered
-    "actions_executed",   # int   – always 1 in this implementation
-    "pushed",             # bool  – pushed by directional pad (gamma only)
-])
+# ════════════════════════════════════════════════════════
+#  TURN RESULT
+# ════════════════════════════════════════════════════════
+@dataclass
+class TurnResult:
+    wall_hits       : int   = 0
+    current_position: tuple = (0, 0)
+    is_dead         : bool  = False
+    is_confused     : bool  = False
+    is_goal_reached : bool  = False
+    teleported      : bool  = False
+    actions_executed: int   = 1
+    pushed          : bool  = False   # gamma only
 
-EpisodeStats = namedtuple("EpisodeStats", [
-    "success",        # bool
-    "path_length",    # total cells traversed (incl. revisits)
-    "turns",          # turns used this episode
-    "deaths",         # number of deaths
-    "unique_cells",   # unique cells visited
-    "total_cells",    # total cell visits (same as path_length)
-])
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  IMAGE / GRID HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════
 def _load_image(path: Path):
     img = Image.open(path).convert("RGB")
     px  = np.array(img)
     h, w, _ = px.shape
     return px, h, w
 
-
-def _pixel_grid(pixels: np.ndarray, h: int, w: int) -> np.ndarray:
-    """Binary (WALL=1 / FREE=0) pixel-level grid using red channel brightness."""
+def _pixel_grid(px: np.ndarray, h: int, w: int) -> np.ndarray:
     g = np.ones((h, w), dtype=np.int8)
-    g[pixels[:, :, 0] > BRIGHTNESS] = FREE
+    g[px[:, :, 0] > BRIGHT] = FREE
     return g
 
+def _cell_size(w: int, h: int) -> int:
+    return max(1, min(w, h) // GRID)
 
-def _find_start_goal_px(pixels, h, w):
-    """Scan top row for start, bottom row for goal; return pixel coords."""
+def px_to_cell(px: int, py: int, cs: int) -> tuple:
+    return (min(max(0, px // cs), GRID - 1),
+            min(max(0, py // cs), GRID - 1))
+
+def cell_to_px(cx: int, cy: int, cs: int) -> tuple:
+    return cx * cs + cs // 2, cy * cs + cs // 2
+
+def _find_start_goal(px_arr, h, w):
     sp = gp = None
     for x in range(w):
-        if pixels[0, x, 0] > BRIGHTNESS:
+        if px_arr[0, x, 0] > BRIGHT:
             sp = (x, 0)
-        if pixels[h - 1, x, 0] > BRIGHTNESS:
+        if px_arr[h - 1, x, 0] > BRIGHT:
             gp = (x, h - 1)
     return sp, gp
 
-
-def _find_hazard_px(pixels, h, w, color_fn, min_sz: int = 20):
-    """
-    Return list of (cx, cy) pixel-space centres for colour clusters
-    that pass color_fn and contain at least min_sz matching pixels.
-    color_fn receives numpy arrays (r, g, b) and must return a boolean array
-    using numpy operators (&, |, ~) rather than Python `and`/`or`.
-    """
-    r_ch = pixels[:, :, 0].astype(np.int32)
-    g_ch = pixels[:, :, 1].astype(np.int32)
-    b_ch = pixels[:, :, 2].astype(np.int32)
-    mask = color_fn(r_ch, g_ch, b_ch).astype(bool)
+def _clusters(px_arr, h, w, color_fn, min_sz=20):
+    r = px_arr[:, :, 0].astype(np.int32)
+    g = px_arr[:, :, 1].astype(np.int32)
+    b = px_arr[:, :, 2].astype(np.int32)
+    mask = color_fn(r, g, b).astype(bool)
     labeled, n = ndimage.label(mask)
     out = []
     for i in range(1, n + 1):
         pts = np.argwhere(labeled == i)
         if len(pts) >= min_sz:
-            cy, cx = pts.mean(0).astype(int)
-            out.append((int(cx), int(cy)))
+            cy2, cx2 = pts.mean(0).astype(int)
+            out.append((int(cx2), int(cy2)))
     return out
 
-
-def _detect_hazards(pixels, h, w) -> dict:
-    """Detect all hazard types from the maze image; return pixel-space data.
-    All color_fn lambdas use numpy bitwise operators (&, |) for vectorised
-    evaluation across the full image in a single pass.
-    """
-
-    # ── Fire pits 🔥  (orange-red: R high, G mid, B low) ────────────────────
-    fire = _find_hazard_px(pixels, h, w,
+def _detect_hazards(px_arr, h, w) -> dict:
+    # Fire pits: orange-red
+    fire = _clusters(px_arr, h, w,
         lambda r, g, b: (r > 180) & (g > 70) & (g < 175) & (b < 100))
 
-    # ── Confusion traps 😵  (bright yellow face: R≈G both high, B very low) ─
-    confusion = _find_hazard_px(pixels, h, w,
+    # Confusion traps: bright yellow emoji
+    conf = _clusters(px_arr, h, w,
         lambda r, g, b: (r > 210) & (g > 160) & (b < 70) & (np.abs(r - g) < 70),
         min_sz=50)
 
-    # ── Teleport pads: detect colour families, pair by x-sorted order ────────
-    # Green 🟢  (G dominant)
-    green = sorted(_find_hazard_px(pixels, h, w,
+    # Teleport pads -- pair colour families by sorted order
+    green  = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (g > 170) & (r < 140) & (b < 160), min_sz=30))
-
-    # Purple 🟣  (R+B elevated, G low)
-    purple = sorted(_find_hazard_px(pixels, h, w,
+    purple = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 100) & (r < 210) & (b > 130) & (g < 100), min_sz=30))
-
-    # Yellow/gold 🟡  (R+G high, B low, R noticeably > G)
-    yellow = sorted(_find_hazard_px(pixels, h, w,
+    yellow = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 190) & (g > 140) & (b < 90) & (r > g + 25), min_sz=30))
-
-    # Red 🔴  (R dominant, G and B both low; larger footprint than fire emojis)
-    red = sorted(_find_hazard_px(pixels, h, w,
+    red    = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 190) & (g < 80) & (b < 80), min_sz=80))
-
-    tp: dict = {}
+    tp = {}
     if len(green)  >= 2: tp[green[0]]  = green[1]
     if len(purple) >= 2: tp[purple[0]] = purple[1]
     if len(yellow) >= 2: tp[yellow[0]] = yellow[1]
     if len(red)    >= 2: tp[red[0]]    = red[1]
 
-    # ── Gamma push pads ⬆️⬅️  (teal / blue arrows) ──────────────────────────
-    all_blue = _find_hazard_px(pixels, h, w,
+    # Gamma push pads: teal/blue arrows
+    all_blue = _clusters(px_arr, h, w,
         lambda r, g, b: (b > 150) & (r < 120) & (g > 120) & (g < 220), min_sz=25)
     mid_y    = h // 2
     push_up  = [(x, y) for x, y in all_blue if y < mid_y]
     push_lft = [(x, y) for x, y in all_blue if y >= mid_y]
 
-    if all_blue and not push_up:
-        print("  [warn] No push_up pads detected in upper half")
-    if all_blue and not push_lft:
-        print("  [warn] No push_left pads detected in lower half")
+    return dict(fire=fire, confusion=conf, teleport=tp,
+                push_up=push_up, push_left=push_lft)
 
-    return dict(
-        fire       = fire,
-        confusion  = confusion,
-        teleport   = tp,
-        push_up    = push_up,
-        push_left  = push_lft,
-    )
-
-
-# ── Cell-space helpers ─────────────────────────────────────────────────────────
-
-def _cell_size(w: int, h: int) -> int:
-    return max(1, min(w, h) // NUM_CELLS)
-
-
-def px_to_cell(px: int, py: int, cs: int) -> tuple:
-    return (min(max(0, px // cs), NUM_CELLS - 1),
-            min(max(0, py // cs), NUM_CELLS - 1))
-
-
-def cell_to_px(cx: int, cy: int, cs: int) -> tuple:
-    return cx * cs + cs // 2, cy * cs + cs // 2
-
-
-def _build_adjacency(pg, w, h, cs):
-    adj = {}
-    free_centres = set()
-    for cy in range(NUM_CELLS):
-        for cx in range(NUM_CELLS):
-            c1x = min(cx * cs + cs // 2, w - 1)
-            c1y = min(cy * cs + cs // 2, h - 1)
-            if pg[c1y, c1x] == FREE:
-                free_centres.add((cx, cy))
-
-    for (cx, cy) in free_centres:
-        nbrs = {}
-        for act, (dx, dy) in DELTAS.items():
-            if act == WAIT:
-                continue
-            nx, ny = cx + dx, cy + dy
-            if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
-                continue
-            if (nx, ny) not in free_centres:
-                continue
-            # Boundary slice - precomputed once per direction
-            if dx == 1:
-                x1 = min(cx * cs + cs // 2, w - 1)
-                x2 = min(nx * cs + cs // 2, w - 1)
-                has_free = np.any(pg[cy*cs : min((cy+1)*cs, h), x1:x2+1] == FREE)
-            elif dx == -1:
-                x1 = min(nx * cs + cs // 2, w - 1)
-                x2 = min(cx * cs + cs // 2, w - 1)
-                has_free = np.any(pg[cy*cs : min((cy+1)*cs, h), x1:x2+1] == FREE)
-            elif dy == 1:
-                # Scan the full vertical span between the two cell centres
-                y1 = min(cy * cs + cs // 2, h - 1)
-                y2 = min(ny * cs + cs // 2, h - 1)
-                has_free = np.any(pg[y1:y2+1, cx*cs : min((cx+1)*cs, w)] == FREE)
-            else:  # dy == -1
-                y1 = min(ny * cs + cs // 2, h - 1)
-                y2 = min(cy * cs + cs // 2, h - 1)
-                has_free = np.any(pg[y1:y2+1, cx*cs : min((cx+1)*cs, w)] == FREE)
-            if has_free:
-                nbrs[act] = (nx, ny)
-        adj[(cx, cy)] = nbrs
-    return adj
-
-def _build_adjacency_cached(pg, w, h, cs, path):
-    cache_key = hashlib.md5(pg.tobytes()).hexdigest()
-    cache_file = path.parent / f".adj_cache_{cache_key}.pkl"
-    if cache_file.exists():
-        return pickle.loads(cache_file.read_bytes())
-    adj = _build_adjacency(pg, w, h, cs)
-    cache_file.write_bytes(pickle.dumps(adj))
-    return adj
-
-def _rotate_90cw(x: float, y: float, px: float, py: float):
-    """Rotate point (x, y) 90° clockwise around pivot (px, py)."""
+def _rotate_90cw(x, y, px, py):
     return px + (y - py), py - (x - px)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  MAZE ENVIRONMENT  (server-side — agent cannot inspect its internals)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class MazeEnvironment:
+def _build_adj(px, w, h, cs) -> dict:
     """
-    Simulates the maze from a PNG image.
-    The agent ONLY receives TurnResult feedback — no internal grid or
-    hazard positions are exposed to the agent.
+    Tile-based adjacency using wall detection at cell boundaries.
+    Each cell is 16px wide; walls are 2px lines at the leading edge of each
+    cell block. Two cells are connected iff the first 2 pixels of the neighbor's
+    leading edge (sampled at the midpoint row/col) are both bright (not black).
+    """
+    half = cs // 2
+
+    def wall_between(cx, cy, nx, ny) -> bool:
+        if nx == cx + 1:   # moving RIGHT: check 2px at left edge of nx
+            by = min(cy * cs + half, h - 1)
+            return (px[by, min(nx*cs,   w-1), 0] <= BRIGHT and
+                    px[by, min(nx*cs+1, w-1), 0] <= BRIGHT)
+        elif nx == cx - 1: # moving LEFT: check 2px at left edge of cx
+            by = min(cy * cs + half, h - 1)
+            return (px[by, min(cx*cs,   w-1), 0] <= BRIGHT and
+                    px[by, min(cx*cs+1, w-1), 0] <= BRIGHT)
+        elif ny == cy + 1: # moving DOWN: check 2px at top edge of ny
+            bx = min(cx * cs + half, w - 1)
+            return (px[min(ny*cs,   h-1), bx, 0] <= BRIGHT and
+                    px[min(ny*cs+1, h-1), bx, 0] <= BRIGHT)
+        else:              # moving UP: check 2px at top edge of cy
+            bx = min(cx * cs + half, w - 1)
+            return (px[min(cy*cs,   h-1), bx, 0] <= BRIGHT and
+                    px[min(cy*cs+1, h-1), bx, 0] <= BRIGHT)
+
+    adj = {}
+    for cy in range(GRID):
+        for cx in range(GRID):
+            nbrs = {}
+            for act, (dx, dy) in DELTAS.items():
+                if act == WAIT:
+                    continue
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < GRID and 0 <= ny < GRID):
+                    continue
+                if not wall_between(cx, cy, nx, ny):
+                    nbrs[act] = (nx, ny)
+            adj[(cx, cy)] = nbrs
+    return adj
+
+_ADJ_VER = b"v4"   # bump when changing adjacency algorithm to invalidate old caches
+
+def _build_adj_cached(px, pg, w, h, cs, path: Path) -> dict:
+    key   = hashlib.md5(pg.tobytes() + _ADJ_VER).hexdigest()
+    cache = path.parent / f".adj_{key}.pkl"
+    if cache.exists():
+        print("    (adjacency loaded from cache)")
+        return pickle.loads(cache.read_bytes())
+    print("    Building adjacency graph ...", end=" ", flush=True)
+    adj = _build_adj(px, w, h, cs)
+    cache.write_bytes(pickle.dumps(adj))
+    print("done, cached.")
+    return adj
+
+
+# ════════════════════════════════════════════════════════
+#  MAZE ENVIRONMENT
+# ════════════════════════════════════════════════════════
+class MazeEnv:
+    """
+    Simulates the maze from a PNG.
+    The agent ONLY receives TurnResult feedback -- never inspects internals.
     """
 
-    def __init__(self, path: Path, is_gamma: bool = False):
+    def __init__(self, path: Path, gamma_mode: bool = False):
         px, h, w  = _load_image(path)
-        self._px  = px
-        self._h   = h
-        self._w   = w
-        self._cs  = _cell_size(w, h)
+        self._px, self._h, self._w = px, h, w
+        cs        = _cell_size(w, h)
+        self._cs  = cs
         self._pg  = _pixel_grid(px, h, w)
-        self._adj = _build_adjacency(self._pg, w, h, self._cs)
-        
-        self._gamma = is_gamma
+        self._adj = _build_adj_cached(px, self._pg, w, h, cs, path)
+        self._gm  = gamma_mode
 
-        # Start / goal
-        sp, gp = _find_start_goal_px(px, h, w)
-        if sp is None or gp is None:
-            raise ValueError(f"Start or goal not found in {path.name}")
-        self._start = px_to_cell(*sp, self._cs)
-        self._goal  = px_to_cell(*gp,  self._cs)
+        sp, gp = _find_start_goal(px, h, w)
+        if not sp or not gp:
+            raise ValueError(f"Start/goal not found in {path.name}")
+        self._start = px_to_cell(*sp, cs)
+        self._goal  = px_to_cell(*gp, cs)
 
-        # Hazards (pixel space → cell space)
         hz = _detect_hazards(px, h, w)
-
-        self._base_fire_px = hz["fire"]   # original fire positions before rotation
-
-        self._conf_cells = frozenset(
-            px_to_cell(x, y, self._cs) for x, y in hz["confusion"])
-
-        self._tele_cells: dict = {
-            px_to_cell(sx, sy, self._cs): px_to_cell(dx, dy, self._cs)
-            for (sx, sy), (dx, dy) in hz["teleport"].items()
+        self._base_fire   = hz["fire"]
+        self._conf_cells  = frozenset(px_to_cell(x, y, cs) for x, y in hz["confusion"])
+        self._tele: dict  = {
+            px_to_cell(sx, sy, cs): px_to_cell(dx2, dy2, cs)
+            for (sx, sy), (dx2, dy2) in hz["teleport"].items()
         }
+        self._push_up  = frozenset(px_to_cell(x, y, cs) for x, y in hz["push_up"])
+        self._push_lft = frozenset(px_to_cell(x, y, cs) for x, y in hz["push_left"])
 
-        # Gamma push pads
-        self._push_up_cells   = frozenset(
-            px_to_cell(x, y, self._cs) for x, y in hz["push_up"])
-        self._push_left_cells = frozenset(
-            px_to_cell(x, y, self._cs) for x, y in hz["push_left"])
+        self._free_count = max(1, sum(1 for nb in self._adj.values() if nb))
 
-        # Approximate number of navigable cells (for metric normalisation)
-        self._free_count = max(1, sum(
-            1 for cell, nbrs in self._adj.items() if nbrs
-        ))
-
-        # Episode state
-        self._ep   = 0
-        self._pos  = self._start
-        self._conf = 0        # confusion turns remaining
+        self._pos    = self._start
+        self._conf   = 0
+        self._turns  = 0          # global turn counter (drives fire rotation)
         self._fire: frozenset = frozenset()
+        self._rotate_fire(0)
 
-        print(
-            f"  Loaded {path.name:<22} | "
-            f"start={self._start} goal={self._goal} cs={self._cs}px | "
-            f"fire={len(self._base_fire_px)} "
-            f"conf={len(self._conf_cells)} "
-            f"tele={len(self._tele_cells)} "
-            f"push_up={len(self._push_up_cells)} "
-            f"push_left={len(self._push_left_cells)}"
-        )
+        print(f"  {path.name:<20} start={self._start} goal={self._goal} "
+              f"cs={cs}px | fire={len(self._base_fire)} "
+              f"conf={len(self._conf_cells)} tele={len(self._tele)} "
+              f"push_up={len(self._push_up)} push_left={len(self._push_lft)}")
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    @property
+    def start(self): return self._start
+    @property
+    def goal(self):  return self._goal
+    @property
+    def cs(self):    return self._cs
+    @property
+    def free_count(self): return self._free_count
 
-    def reset(self, episode: int | None = None) -> tuple:
-        """Reset to start position, rotate fire pits for new episode."""
-        self._ep  = episode if episode is not None else self._ep + 1
-        self._pos = self._start
-        self._conf = 0
-        self._rotate_fire(self._ep)
+    def reset(self, ep: int = 0) -> tuple:
+        self._pos   = self._start
+        self._conf  = 0
+        self._turns = 0
+        self._rotate_fire(0)
         return self._pos
 
     def step(self, action: int) -> TurnResult:
-        """Execute one action; return TurnResult feedback."""
-        wall_hits  = 0
-        teleported = False
-        pushed     = False
+        # Advance turn counter and rotate fire every 5 turns (spec requirement)
+        self._turns += 1
+        self._rotate_fire((self._turns // 5) % 4)
 
-        # Confusion reversal
-        eff_action = REVERSE[action] if self._conf > 0 else action
+        eff = REVERSE[action] if self._conf > 0 else action
         if self._conf > 0:
             self._conf -= 1
 
-        # Movement
-        cx, cy = self._pos
-        if eff_action == WAIT:
-            new_pos = (cx, cy)
+        cx, cy    = self._pos
+        wall_hits = 0
+        if eff == WAIT:
+            new = (cx, cy)
         else:
             nbrs = self._adj.get((cx, cy), {})
-            if eff_action in nbrs:
-                new_pos = nbrs[eff_action]
+            if eff in nbrs:
+                new = nbrs[eff]
             else:
-                new_pos = (cx, cy)
+                new = (cx, cy)
                 wall_hits = 1
+        self._pos = new
 
-        self._pos = new_pos
-
-        # ── Gamma push pads ──────────────────────────────────────────────────
-        if self._gamma:
-            if self._pos in self._push_up_cells:
-                nbrs2 = self._adj.get(self._pos, {})
-                if UP in nbrs2:
-                    self._pos = nbrs2[UP]
+        # Gamma push pads
+        pushed = False
+        if self._gm:
+            if self._pos in self._push_up:
+                nb2 = self._adj.get(self._pos, {})
+                if UP in nb2: self._pos = nb2[UP]
                 pushed = True
-            elif self._pos in self._push_left_cells:
-                nbrs2 = self._adj.get(self._pos, {})
-                if LEFT in nbrs2:
-                    self._pos = nbrs2[LEFT]
+            elif self._pos in self._push_lft:
+                nb2 = self._adj.get(self._pos, {})
+                if LEFT in nb2: self._pos = nb2[LEFT]
                 pushed = True
 
-        # ── Fire pit ─────────────────────────────────────────────────────────
+        # Fire pit -> instant death, respawn at start
         if self._pos in self._fire:
             self._pos  = self._start
             self._conf = 0
-            return TurnResult(wall_hits, self._pos, True,
-                              False, False, False, 1, pushed)
+            return TurnResult(wall_hits, self._pos, True, False, False, False, 1, pushed)
 
-        # ── Teleport ─────────────────────────────────────────────────────────
-        if self._pos in self._tele_cells:
-            self._pos  = self._tele_cells[self._pos]
-            teleported = True
-            # Handle chained teleport
-            if self._pos in self._tele_cells:
-                self._pos = self._tele_cells[self._pos]
+        # Teleport
+        tele = False
+        if self._pos in self._tele:
+            self._pos = self._tele[self._pos]
+            tele = True
+            if self._pos in self._tele:      # chained teleport
+                self._pos = self._tele[self._pos]
 
-        # ── Confusion trap ───────────────────────────────────────────────────
+        # Confusion trap
         if self._pos in self._conf_cells:
             self._conf = 2
 
-        goal = (self._pos == self._goal)
-        return TurnResult(wall_hits, self._pos, False,
-                          self._conf > 0, goal, teleported, 1, pushed)
+        goal = self._pos == self._goal
+        return TurnResult(wall_hits, self._pos, False, self._conf > 0,
+                          goal, tele, 1, pushed)
 
-    # ── Properties for visualiser (NOT used by the agent) ────────────────────
+    def pixels_copy(self): return self._px.copy()
 
-    @property
-    def start_cell(self) -> tuple:
-        return self._start
-
-    @property
-    def goal_cell(self) -> tuple:
-        return self._goal
-
-    @property
-    def cell_size(self) -> int:
-        return self._cs
-
-    @property
-    def pixels_copy(self) -> np.ndarray:
-        return self._px.copy()
-
-    @property
-    def num_free_cells(self) -> int:
-        return self._free_count
-
-    # ── Internal ─────────────────────────────────────────────────────────────
-
-    def _rotate_fire(self, episode: int):
-        """
-        Rotate the fire-pit cluster 90° CW × episode around the bottommost pit
-        (highest y = bottom of the V).  Only positions landing on FREE cells
-        remain active.
-        """
-        if not self._base_fire_px:
+    def _rotate_fire(self, slot: int):
+        if not self._base_fire:
             self._fire = frozenset()
             return
-
-        # Pivot = pixel with maximum y (visual bottom of the V arrangement)
-        ppx, ppy = max(self._base_fire_px, key=lambda p: p[1])
-        rot      = episode % 4
+        ppx, ppy = max(self._base_fire, key=lambda p: p[1])
         active   = []
-        for (x, y) in self._base_fire_px:
+        for x, y in self._base_fire:
             rx, ry = float(x), float(y)
-            for _ in range(rot):
+            for _ in range(slot % 4):
                 rx, ry = _rotate_90cw(rx, ry, ppx, ppy)
-            xi = int(round(rx))
-            yi = int(round(ry))
-            xi = min(max(0, xi), self._w - 1)
-            yi = min(max(0, yi), self._h - 1)
+            xi = min(max(0, int(round(rx))), self._w - 1)
+            yi = min(max(0, int(round(ry))), self._h - 1)
             active.append(px_to_cell(xi, yi, self._cs))
-
         self._fire = frozenset(active)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  BFS ON KNOWN MAP  (used internally by the agent)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _bfs_known(known: dict, start: tuple, goal: tuple,
-               danger: set, blocked: set | None = None,
-               tele_map: dict | None = None) -> list:
+# ════════════════════════════════════════════════════════
+#  BFS ON KNOWN MAP
+# ════════════════════════════════════════════════════════
+def bfs(known: dict, start: tuple, goal: tuple,
+        danger: set, blocked: set, tele: dict,
+        passable: set | None = None) -> list:
     """
-    BFS strictly through the agent's DISCOVERED free cells.
-    - Only traverses cells present in `known` with value != "wall"/"death".
-    - Skips cells in `danger`.
-    - Skips directed edges in `blocked` (set of (from, to) tuples).
-    - Follows teleport edges in `tele_map` (pad_cell → dest_cell).
-    Returns a path list, or [] if goal is unreachable within known map.
+    BFS strictly through the agent's discovered cells.
+    Skips danger cells and blocked directed edges. Follows teleport edges.
+    If passable is provided, only traverses confirmed-passable edges.
+    Returns path list (start...goal), or [] if unreachable.
     """
     if start not in known:
         return []
@@ -502,202 +384,125 @@ def _bfs_known(known: dict, start: tuple, goal: tuple,
         cx, cy = cur
         for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
             nb = (cx + dx, cy + dy)
-            if nb in came:
+            if nb in came or nb not in known or nb in danger:
                 continue
-            if nb not in known:
+            if (cur, nb) in blocked:
                 continue
-            if nb in danger:
+            if passable is not None and (cur, nb) not in passable:
                 continue
-            if blocked and (cur, nb) in blocked:
-                continue
-            queue.append(nb)
             came[nb] = cur
-        # Follow teleport edge from this pad cell (if any)
-        if tele_map and cur in tele_map:
-            dest = tele_map[cur]
-            if dest not in came and dest in known:
-                if known[dest] not in ("wall", "death") and dest not in danger:
-                    came[dest] = cur
-                    queue.append(dest)
+            queue.append(nb)
+        if cur in tele:
+            dest = tele[cur]
+            if dest not in came and dest in known and dest not in danger:
+                came[dest] = cur
+                queue.append(dest)
     return []
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Q-LEARNING AGENT  (client-side — only sees TurnResult)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class QLearningAgent:
+# ════════════════════════════════════════════════════════
+#  Q-LEARNING AGENT
+# ════════════════════════════════════════════════════════
+class Agent:
     """
     Tabular Q-Learning agent.
-    State  : (cx, cy, confused: 0|1)
-    Actions: UP RIGHT DOWN LEFT WAIT  (5 actions)
-
-    The agent never inspects MazeEnvironment's private attributes.
-    It builds its own internal map purely from TurnResult feedback.
+    State: (x, y, confused: 0|1) -- 5 actions per state.
+    Builds its own internal map purely from TurnResult feedback.
+    Never inspects MazeEnv internals.
     """
 
-    def __init__(self, free_cells_hint: int = 2048):
+    def __init__(self):
         self.epsilon = EPS_START
-        self._hint   = free_cells_hint   # updated when maze is loaded
 
-        # ── Persistent across all episodes ───────────────────────────────────
-        self.q_table = np.zeros((NUM_CELLS, NUM_CELLS, 2, NUM_ACTIONS), dtype=np.float32)
-        # known_map: visited free/special cells only (no "wall" entries)
-        self.known_map: dict = {}       # (cx,cy) → "free"|"death"|
-                                        #           "confusion"|"teleport"|"goal"
-        # Blocked directed edges: (from_cell, to_cell) confirmed impassable
-        self._blocked: set  = set()
-        self._danger: set   = set()     # cells known to be lethal
-        self._tele_map: dict = {}        # pad_cell → dest_cell (inferred from TurnResult)
-        self._rot_danger: dict = {0: set(), 1: set(), 2: set(), 3: set()}
-        self._ep_count: int = 0
-        self._ep_turn_count: int = 0     # turns within current episode (drives fire rotation)
-        self._goal_cell: tuple | None  = None
-        self._start_cell: tuple | None = None
+        # Persistent across all episodes
+        self.q          = np.zeros((GRID, GRID, 2, N_ACTIONS), dtype=np.float32)
+        self.known      : dict  = {}   # (x,y) -> "free"|"death"|"teleport"|"confusion"|"goal"
+        self.blocked    : set   = set()   # (from_cell, to_cell) confirmed impassable
+        self.passable   : set   = set()   # (from_cell, to_cell) confirmed traversable
+        self.danger     : set   = set()   # cells lethal at current rotation slot
+        self.rot_danger : dict  = {0:set(), 1:set(), 2:set(), 3:set()}
+        self.tele       : dict  = {}   # pad -> dest (inferred)
+        self.goal       : Optional[tuple] = None
+        self.start      : Optional[tuple] = None
+        self.best_path  : list = []
+        self.best_turns : int  = 999_999
 
-        # Replanning efficiency (accumulate across all episodes in a phase)
-        self._replan_attempts:  int = 0
-        self._replan_successes: int = 0
-
-        self.best_path: list | None = None
-        self.best_turns: int        = 999_999
-
-        # ── Per-episode (reset each call to reset_episode) ───────────────────
-        self._frontier_cache      = None
-        self._map_size_at_cache   = 0
-        self._goal_path_cache: list | None = None   # cached BFS path to goal
-        self._goal_cache_key: tuple | None = None   # (pos, danger_hash, map_len)
-        self._pos:       tuple = (0, 0)
-        self._confused:  bool  = False
-        self._ep_path:   list  = []
+        # Per-episode (reset each episode)
+        self._pos      : tuple = (0, 0)
+        self._confused : bool  = False
+        self._ep_path  : list  = []
+        self._ep_cells : set   = set()
         self._ep_deaths: int   = 0
-        self._ep_turns:  int   = 0
-        self._ep_cells:  set   = set()
-
-    # ── Episode lifecycle ─────────────────────────────────────────────────────
+        self._ep_turns : int   = 0
+        self._ep_tc    : int   = 0    # turn count within episode (drives fire rotation)
 
     def reset_episode(self, start: tuple):
-        self._pos           = start
-        self._confused      = False
-        self._ep_path       = [start]
-        self._ep_deaths     = 0
-        self._ep_turns      = 0
-        self._ep_turn_count = 0
-        self._ep_cells      = {start}
-        self._goal_path_cache = None
-        self._goal_cache_key  = None
-        if self._start_cell is None:
-            self._start_cell = start
-        self.known_map.setdefault(start, "free")
-        self._ep_count += 1
-        self._danger = set(self._rot_danger[0])  # episodes always start at rotation 0
+        self._pos       = start
+        self._confused  = False
+        self._ep_path   = [start]
+        self._ep_cells  = {start}
+        self._ep_deaths = 0
+        self._ep_turns  = 0
+        self._ep_tc     = 0
+        if self.start is None:
+            self.start = start
+        self.known.setdefault(start, "free")
+        self.danger = set(self.rot_danger[0])
+
+    def _rot_slot(self) -> int:
+        return (self._ep_tc // 5) % 4
+
+    def _sync_danger(self):
+        self.danger = set(self.rot_danger[self._rot_slot()])
 
     # ── Action selection ──────────────────────────────────────────────────────
+    def choose(self, pos: tuple) -> int:
+        self._sync_danger()
 
-    def choose_action(self, pos: tuple, confused: bool) -> int:
-        """
-        BFS-guided action selection with epsilon as a random override:
-          epsilon chance  → random walk (frontier-biased for exploration).
-          1-epsilon chance:
-            Phase 2 (goal known)   : BFS to goal through known safe cells.
-            Phase 1 (goal unknown) : BFS to nearest frontier, step into unknown.
-        BFS always runs when epsilon does NOT trigger — this ensures the agent
-        actually navigates rather than spinning in place once epsilon drops.
-        """
-        # Refresh danger for the current fire-rotation slot
-        rot = (self._ep_turn_count // 5) % 4
-        self._danger = set(self._rot_danger[rot])
-
-        # ── Small epsilon-random override (prevents loops, handles hazards) ───
         if random.random() < self.epsilon:
-            frontier_acts = self._frontier_actions(pos)
-            if frontier_acts:
-                return random.choice(frontier_acts)
-            return random.randint(0, NUM_ACTIONS - 1)
+            fa = self._frontier_actions(pos)
+            return random.choice(fa) if fa else random.randint(0, N_ACTIONS - 1)
 
-        # ── Deterministic BFS component ───────────────────────────────────────
-
-        # Phase 2: goal found → navigate to it (with path cache)
-        if self._goal_cell is not None:
-            cache_key = (pos, len(self._danger), len(self.known_map))
-            if self._goal_cache_key == cache_key and self._goal_path_cache and len(self._goal_path_cache) > 1:
-                path = self._goal_path_cache
-            else:
-                self._replan_attempts += 1
-                safe = {k: v for k, v in self.known_map.items()
-                        if k not in self._danger}
-                path = _bfs_known(safe, pos, self._goal_cell, self._danger,
-                                  blocked=self._blocked, tele_map=self._tele_map)
-                self._goal_path_cache = path
-                self._goal_cache_key  = cache_key
-                if len(path) > 1:
-                    self._replan_successes += 1
+        # Phase 2: goal known -> BFS to goal through safe known cells
+        if self.goal is not None:
+            safe = {k: v for k, v in self.known.items() if k not in self.danger}
+            path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele, self.passable)
             if len(path) > 1:
-                return self._delta_to_action(pos, path[1])
+                return self._dir(pos, path[1])
 
-        # Phase 1: goal unknown → BFS to nearest frontier, step into unknown
-        fc, unk = self._find_nearest_frontier(pos)
+        # Phase 1: goal unknown -> BFS to nearest frontier
+        fc, unk = self._nearest_frontier(pos)
         if fc is not None:
-            if fc == pos:
-                # Already at a frontier cell — step into the unknown cell
-                if unk is not None:
-                    return self._delta_to_action(pos, unk)
-            else:
-                path = _bfs_known(self.known_map, pos, fc, self._danger,
-                                  blocked=self._blocked, tele_map=self._tele_map)
-                if len(path) > 1:
-                    return self._delta_to_action(pos, path[1])
+            if fc == pos and unk is not None:
+                return self._dir(pos, unk)
+            path = bfs(self.known, pos, fc, self.danger, self.blocked, self.tele, self.passable)
+            if len(path) > 1:
+                return self._dir(pos, path[1])
 
-        # ── Fallback: random walk ─────────────────────────────────────────────
-        frontier_acts = self._frontier_actions(pos)
-        if frontier_acts:
-            return random.choice(frontier_acts)
-        return random.randint(0, NUM_ACTIONS - 1)
+        fa = self._frontier_actions(pos)
+        return random.choice(fa) if fa else random.randint(0, N_ACTIONS - 1)
 
-    def _delta_to_action(self, pos: tuple, nxt: tuple) -> int:
-        dx, dy = nxt[0] - pos[0], nxt[1] - pos[1]
-        return {(0,-1): UP, (1,0): RIGHT, (0,1): DOWN, (-1,0): LEFT}.get(
+    def _dir(self, a: tuple, b: tuple) -> int:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        return {(0,-1):UP, (1,0):RIGHT, (0,1):DOWN, (-1,0):LEFT}.get(
             (dx, dy), random.randint(0, 3))
 
     def _frontier_actions(self, pos: tuple) -> list:
-        """Return actions whose immediate neighbour has not yet been discovered."""
         cx, cy = pos
-        out = []
-        for act, (dx, dy) in DELTAS.items():
-            if act == WAIT:
-                continue
-            nb = (cx + dx, cy + dy)
-            if (0 <= nb[0] < NUM_CELLS and 0 <= nb[1] < NUM_CELLS
-                    and nb not in self.known_map):
-                out.append(act)
-        return out
+        return [act for act, (dx, dy) in DELTAS.items()
+                if act != WAIT
+                and 0 <= cx + dx < GRID and 0 <= cy + dy < GRID
+                and (cx + dx, cy + dy) not in self.known
+                and (pos, (cx + dx, cy + dy)) not in self.blocked]
 
-    def _find_nearest_frontier(self, pos: tuple):
-        current_size = len(self.known_map)
-        if (self._frontier_cache is not None
-                and self._frontier_cache[0] == pos
-                and self._map_size_at_cache == current_size):
-            return self._frontier_cache[1]
-        result = self._find_nearest_frontier_uncached(pos)
-        self._frontier_cache = (pos, result)
-        self._map_size_at_cache = current_size
-        return result
-
-    def _find_nearest_frontier_uncached(self, pos: tuple):
-        """
-        BFS strictly through known (non-wall, non-danger) cells to find the
-        nearest cell that has an undiscovered neighbour reachable via a
-        non-blocked edge.
-        Returns (frontier_cell, unknown_neighbour) or (None, None).
-        """
-        # Check current position first
+    def _nearest_frontier(self, pos: tuple):
+        # Is current cell already on a frontier?
         for act, (dx, dy) in DELTAS.items():
-            if act == WAIT:
-                continue
-            nb = (pos[0]+dx, pos[1]+dy)
-            if (0 <= nb[0] < NUM_CELLS and 0 <= nb[1] < NUM_CELLS
-                    and nb not in self.known_map
-                    and (pos, nb) not in self._blocked):
+            if act == WAIT: continue
+            nb = (pos[0] + dx, pos[1] + dy)
+            if (0 <= nb[0] < GRID and 0 <= nb[1] < GRID
+                    and nb not in self.known
+                    and (pos, nb) not in self.blocked):
                 return pos, nb
 
         queue   = deque([pos])
@@ -706,493 +511,413 @@ class QLearningAgent:
             cur    = queue.popleft()
             cx, cy = cur
             for dx, dy in ((0,-1),(1,0),(0,1),(-1,0)):
-                nb = (cx+dx, cy+dy)
-                if nb in visited:
+                nb = (cx + dx, cy + dy)
+                if nb in visited or not (0 <= nb[0] < GRID and 0 <= nb[1] < GRID):
                     continue
-                if not (0 <= nb[0] < NUM_CELLS and 0 <= nb[1] < NUM_CELLS):
-                    continue
-                if (cur, nb) in self._blocked:
+                if (cur, nb) in self.blocked:
                     continue
                 visited.add(nb)
-                nb_type = self.known_map.get(nb)
-                if nb_type is None:
-                    # nb is unknown and reachable — cur is the frontier cell
-                    return cur, nb
-                if nb in self._danger:
-                    continue
-                queue.append(nb)
-            # Follow teleport edge from this pad cell (if any)
-            if cur in self._tele_map:
-                dest = self._tele_map[cur]
-                if dest not in visited:
+                if nb not in self.known:
+                    return cur, nb          # frontier found
+                if nb not in self.danger and self.known[nb] != "wall":
+                    queue.append(nb)
+            if cur in self.tele:
+                dest = self.tele[cur]
+                if dest not in visited and dest in self.known and dest not in self.danger:
                     visited.add(dest)
-                    dest_type = self.known_map.get(dest)
-                    if dest_type is None:
-                        return cur, dest  # frontier reachable via teleport
-                    if dest_type not in ("wall", "death") and dest not in self._danger:
-                        queue.append(dest)
+                    queue.append(dest)
         return None, None
 
-    # ── Q-table update ────────────────────────────────────────────────────────
-
-    def update_q(self, prev: tuple, prev_confused: bool,
+    # ── Q-table update ─────────────────────────────────────────────────────────
+    def update_q(self, prev: tuple, prev_conf: bool,
                  action: int, reward: float, tr: TurnResult):
-        s_q  = self.q_table[prev[0], prev[1], int(prev_confused)]
-        ns_q = self.q_table[tr.current_position[0], tr.current_position[1], int(tr.is_confused)]
-        target = reward if tr.is_goal_reached else reward + GAMMA_RL * float(ns_q.max())
-        s_q[action] += ALPHA * (target - float(s_q[action]))
+        s  = self.q[prev[0], prev[1], int(prev_conf)]
+        ns = self.q[tr.current_position[0], tr.current_position[1], int(tr.is_confused)]
+        td = reward + (0.0 if tr.is_goal_reached else GAMMA_RL * float(ns.max()))
+        s[action] += LR * (td - float(s[action]))
 
-    # ── Observation / internal map update ────────────────────────────────────
-
+    # ── Observe TurnResult and update internal map ─────────────────────────────
     def observe(self, prev: tuple, action: int, tr: TurnResult):
-        """Update internal map and per-episode stats from TurnResult."""
-        cur = tr.current_position
-        self._ep_turns      += 1
-        self._ep_turn_count += 1
-        rot = (self._ep_turn_count // 5) % 4
-        self._danger = set(self._rot_danger[rot])
+        """Update internal map from TurnResult only. Never reads MazeEnv directly."""
+        self._ep_turns += 1
+        self._ep_tc    += 1
+        self._sync_danger()
+        rot = self._rot_slot()
 
         if tr.is_dead:
-            # Infer the fire pit location from prev + action direction.
+            # Infer fire-pit location: moved from prev in direction action
             if tr.wall_hits == 0:
-                dx, dy  = DELTAS.get(action, (0, 0))
-                pit_loc = (prev[0] + dx, prev[1] + dy)
-                if 0 <= pit_loc[0] < NUM_CELLS and 0 <= pit_loc[1] < NUM_CELLS:
-                    self.known_map[pit_loc] = "death"
-                    self._danger.add(pit_loc)
-                    self._rot_danger[rot].add(pit_loc)
+                dx, dy = DELTAS.get(action, (0, 0))
+                pit    = (prev[0] + dx, prev[1] + dy)
+                if 0 <= pit[0] < GRID and 0 <= pit[1] < GRID:
+                    self.known[pit] = "death"
+                    self.danger.add(pit)
+                    self.rot_danger[rot].add(pit)
             self._ep_deaths += 1
-            self._pos      = self._start_cell if self._start_cell else cur
-            self._confused = False
+            self._pos        = self.start or tr.current_position
+            self._confused   = False
             return
 
-        # Successful move
+        cur            = tr.current_position   # always use TurnResult.current_position
         self._pos      = cur
         self._confused = tr.is_confused
         self._ep_cells.add(cur)
         self._ep_path.append(cur)
 
         if tr.is_goal_reached:
-            self.known_map[cur] = "goal"
-            if self._goal_cell is None:
-                self._goal_cell = cur
+            self.known[cur] = "goal"
+            if self.goal is None:
+                self.goal = cur
         elif tr.teleported:
-            self.known_map.setdefault(cur, "teleport")
-            # Infer and record the teleport pad cell + the pad→dest edge
+            self.known.setdefault(cur, "teleport")
+            # Infer the pad cell stepped onto before being teleported
             if tr.wall_hits == 0:
                 dx, dy = DELTAS.get(action, (0, 0))
-                pad = (prev[0] + dx, prev[1] + dy)
-                if 0 <= pad[0] < NUM_CELLS and 0 <= pad[1] < NUM_CELLS:
-                    self.known_map.setdefault(pad, "teleport")
-                    self._tele_map[pad] = cur
+                pad    = (prev[0] + dx, prev[1] + dy)
+                if 0 <= pad[0] < GRID and 0 <= pad[1] < GRID:
+                    self.known.setdefault(pad, "teleport")
+                    self.tele[pad] = cur
         elif tr.is_confused:
-            self.known_map.setdefault(cur, "confusion")
+            self.known.setdefault(cur, "confusion")
         else:
-            # Overwrite stale "death" from a past fire-pit rotation
-            if self.known_map.get(cur) == "death":
-                self.known_map[cur] = "free"
+            if self.known.get(cur) == "death":
+                self.known[cur] = "free"   # fire rotated away -- cell safe now
             else:
-                self.known_map.setdefault(cur, "free")
+                self.known.setdefault(cur, "free")
 
-        # Record a blocked directed edge — the move prev→target was rejected.
-        # We do NOT mark target as "wall" because the cell may be reachable
-        # from another direction; we only know THIS edge is impassable.
+        # Record confirmed traversable edge (cardinal moves only, not teleport jumps)
+        if tr.wall_hits == 0 and not tr.is_dead:
+            dx2 = cur[0] - prev[0]
+            dy2 = cur[1] - prev[1]
+            if abs(dx2) + abs(dy2) == 1:
+                self.passable.add((prev, cur))
+
+        # Record impassable edge from wall hit (bidirectional -- walls block both ways)
         if tr.wall_hits > 0:
             dx, dy = DELTAS.get(action, (0, 0))
             target = (prev[0] + dx, prev[1] + dy)
-            if 0 <= target[0] < NUM_CELLS and 0 <= target[1] < NUM_CELLS:
-                self._blocked.add((prev, target))
+            if 0 <= target[0] < GRID and 0 <= target[1] < GRID:
+                self.blocked.add((prev, target))
+                self.blocked.add((target, prev))
 
     def record_success(self, turns: int):
         if turns < self.best_turns:
             self.best_turns = turns
-            self.best_path  = list(self._ep_path)
-
-    def get_episode_stats(self) -> EpisodeStats:
-        return EpisodeStats(
-            success      = self._goal_cell in self._ep_cells,
-            path_length  = len(self._ep_path),
-            turns        = self._ep_turns,
-            deaths       = self._ep_deaths,
-            unique_cells = len(self._ep_cells),
-            total_cells  = len(self._ep_path),
-        )
+            # Use BFS over confirmed-passable edges to get clean shortest path
+            clean = bfs(self.known, self.start, self.goal,
+                        set(), self.blocked, self.tele, self.passable)
+            self.best_path = clean if len(clean) > 1 else list(self._ep_path)
 
     def decay_epsilon(self):
         self.epsilon = max(EPS_END, self.epsilon * EPS_DECAY)
 
+    @property
+    def ep_stats(self) -> dict:
+        return dict(
+            success  = (self.goal in self._ep_cells) if self.goal else False,
+            path_len = len(self._ep_path),
+            turns    = self._ep_turns,
+            deaths   = self._ep_deaths,
+            unique   = len(self._ep_cells),
+        )
 
-# ═════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════
+#  TRANSFER AGENT (alpha -> beta/gamma)
+# ════════════════════════════════════════════════════════
+def transfer(src: Agent, eps: float) -> Agent:
+    """
+    Clone trained agent for a new maze.
+    Reclassifies alpha death cells as free -- beta/gamma fire is in different
+    positions, so those cells are safe and may be the only path to the goal.
+    Clears blocked edges and danger (beta/gamma may have different wall layout).
+    """
+    dst = Agent()
+    dst.q          = src.q.copy()
+    dst.known      = {k: ("free" if v == "death" else v)
+                      for k, v in src.known.items()}
+    dst.goal       = src.goal
+    dst.start      = src.start
+    dst.tele       = dict(src.tele)
+    dst.blocked    = set()
+    dst.passable   = set(src.passable)
+    dst.danger     = set()
+    dst.rot_danger = {0:set(), 1:set(), 2:set(), 3:set()}
+    dst.epsilon    = eps
+    dst.best_path  = list(src.best_path)
+    dst.best_turns = src.best_turns
+    return dst
+
+
+# ════════════════════════════════════════════════════════
 #  EPISODE RUNNER
-# ═════════════════════════════════════════════════════════════════════════════
-
-def run_episodes(env: MazeEnvironment, agent: QLearningAgent,
-                 n: int, train: bool, label: str) -> list:
-    """
-    Run n episodes.
-    If train=True  → update Q-table after each step.
-    If train=False → map-building + BFS only; Q-table unchanged.
-    Epsilon always decays to let the agent exploit its growing map.
-    """
-    stats = []
+# ════════════════════════════════════════════════════════
+def run_episodes(env: MazeEnv, agent: Agent, n: int,
+                 train: bool, label: str) -> list:
+    all_stats = []
     for ep in range(n):
         pos = env.reset(ep)
         agent.reset_episode(pos)
-        agent.reset_episode(pos)
-                
-        agent._hint = env.num_free_cells
 
         for turn in range(MAX_TURNS):
-            prev_confused = agent._confused
-            action = agent.choose_action(pos, prev_confused)
-            tr     = env.step(action)
+            prev_conf = agent._confused
+            action    = agent.choose(pos)
+            tr        = env.step(action)
 
             # Reward shaping
             reward = R_STEP
             if tr.wall_hits:
-                reward += R_WALL_HIT * tr.wall_hits
+                reward += R_WALL * tr.wall_hits
             if tr.is_dead:
                 reward += R_DEATH
             elif tr.is_goal_reached:
                 reward += R_GOAL
             else:
-                if tr.is_confused and not prev_confused:
-                    reward += R_CONFUSION
-                if tr.current_position not in agent.known_map:
+                if tr.is_confused and not prev_conf:
+                    reward += R_CONFUSED
+                if tr.current_position not in agent.known:
                     reward += R_NEW_CELL
 
             if train:
-                agent.update_q(pos, prev_confused, action, reward, tr)
+                agent.update_q(pos, prev_conf, action, reward, tr)
 
             agent.observe(pos, action, tr)
-            pos = agent._pos   # may differ from tr.current_position after death
+            pos = agent._pos   # use agent's pos (handles death respawn correctly)
 
             if tr.is_goal_reached:
                 agent.record_success(turn + 1)
                 break
 
-        stats.append(agent.get_episode_stats())
-        agent.decay_epsilon()   # always decay — helps test episodes exploit map
+        all_stats.append(agent.ep_stats)
+        agent.decay_epsilon()
 
         if (ep + 1) % 20 == 0 or ep == n - 1:
-            recent = stats[-min(10, len(stats)):]
-            sr     = sum(s.success for s in recent) / len(recent)
-            print(f"    [{label[:20]:<20}] ep {ep+1:>3}/{n}  "
-                  f"ε={agent.epsilon:.3f}  "
-                  f"SR(last10)={sr:.0%}  "
-                  f"map={len(agent.known_map)}/{env.num_free_cells}")
+            recent = all_stats[-10:]
+            sr     = sum(s["success"] for s in recent) / len(recent)
+            print(f"    [{label[:18]:<18}] ep {ep+1:>3}/{n}  "
+                  f"e={agent.epsilon:.3f}  SR(10)={sr:.0%}  "
+                  f"map={len(agent.known)}/{env.free_count}")
 
-    return stats
+    return all_stats
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  METRICS
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+def report_metrics(stats: list, agent: Agent, env: MazeEnv,
+                   label: str, train_stats: list | None = None) -> dict:
+    succ  = [s for s in stats if s["success"]]
+    tot_d = sum(s["deaths"] for s in stats)
+    tot_t = sum(s["turns"]  for s in stats)
 
-def report_metrics(stats: list, agent: QLearningAgent,
-                   env: MazeEnvironment, label: str,
-                   train_stats: list | None = None) -> dict:
-    """Compute and print all required + bonus metrics."""
-    successes  = [s for s in stats if s.success]
-    total_d    = sum(s.deaths for s in stats)
-    total_t    = sum(s.turns  for s in stats)
-
-    SR  = len(successes) / len(stats) if stats else 0.0
-    APL = (sum(s.path_length for s in successes) / len(successes)
-           if successes else float("inf"))
-    AT  = (sum(s.turns for s in successes) / len(successes)
-           if successes else float("inf"))
-    DR  = total_d / max(1, total_t)
-    EE  = (sum(s.unique_cells / max(1, s.total_cells) for s in stats) / len(stats)
+    SR  = len(succ) / len(stats) if stats else 0.0
+    APL = sum(s["path_len"] for s in succ) / len(succ) if succ else float("inf")
+    AT  = sum(s["turns"]    for s in succ) / len(succ) if succ else float("inf")
+    DR  = tot_d / max(1, tot_t)
+    EE  = (sum(s["unique"] / max(1, s["path_len"]) for s in stats) / len(stats)
            if stats else 0.0)
-    MC  = (len([v for v in agent.known_map.values() if v != "wall"])
-           / env.num_free_cells)
-    RE  = agent._replan_successes / max(1, agent._replan_attempts)
+    MC  = (len([v for v in agent.known.values() if v != "wall"])
+           / env.free_count)
 
-    # Learning efficiency: first episode where rolling-10 SR ≥ 80 %
-    LE_ep = None
+    LE = None
     if train_stats:
-        window = 10
-        for i in range(window, len(train_stats) + 1):
-            chunk = train_stats[i - window: i]
-            if sum(s.success for s in chunk) / window >= 0.80:
-                LE_ep = i
+        for i in range(10, len(train_stats) + 1):
+            if sum(s["success"] for s in train_stats[i-10:i]) / 10 >= 0.80:
+                LE = i
                 break
 
-    print(f"\n{'─'*54}")
-    print(f"  METRICS  —  {label}")
-    print(f"{'─'*54}")
-    print(f"  Success Rate            : {SR:>7.1%}   (target >80 %)")
-    print(f"  Avg Path Length         : {APL:>8.1f} cells")
-    print(f"  Avg Turns to Solution   : {AT:>8.1f}   (target <1 000)")
-    print(f"  Death Rate              : {DR:>8.4f}   (target <0.05)")
-    print(f"  [Bonus] Exploration Eff.: {EE:.4f}")
-    print(f"  [Bonus] Map Completeness: {MC:.1%}")
-    print(f"  [Bonus] Replanning Eff. : {RE:.4f}  ({agent._replan_successes}/{agent._replan_attempts} BFS calls succeeded)")
-    if LE_ep is not None:
-        print(f"  [Bonus] Learning Eff.   : converged at episode {LE_ep}")
+    bar = "-" * 52
+    print(f"\n{bar}")
+    print(f"  METRICS  --  {label}")
+    print(f"{bar}")
+    print(f"  Success Rate          : {SR:>7.1%}  (target >80%)")
+    print(f"  Avg Path Length       : {APL:>8.1f} cells")
+    print(f"  Avg Turns to Solution : {AT:>8.1f}  (target <1000)")
+    print(f"  Death Rate            : {DR:>8.4f}  (target <0.05)")
+    print(f"  [Bonus] Exploration Efficiency : {EE:.4f}")
+    print(f"  [Bonus] Map Completeness       : {MC:.1%}")
+    if LE:
+        print(f"  [Bonus] Learning Efficiency    : converged at episode {LE}")
     elif train_stats:
-        print(f"  [Bonus] Learning Eff.   : did not reach 80 % SR during training")
-    print(f"{'─'*54}")
+        print(f"  [Bonus] Learning Efficiency    : did not converge to 80% during training")
+    print(bar)
+    return dict(SR=SR, APL=APL, AT=AT, DR=DR, EE=EE, MC=MC, LE=LE)
 
-    return dict(SR=SR, APL=APL, AT=AT, DR=DR, EE=EE, MC=MC, RE=RE, LE=LE_ep)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  VISUALISATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _save_path_image(env: MazeEnvironment, path_cells: list, out: Path):
-    """Draw best-found solution path (magenta) on the maze image and save."""
+# ════════════════════════════════════════════════════════
+def save_path_img(env: MazeEnv, path_cells: list, out: Path):
     if not path_cells:
-        print(f"    (no path to save for {out.name})")
-        return
-    img = env.pixels_copy
-    cs  = env.cell_size
-    t   = 2
-    h, w = img.shape[:2]
-    for (cx, cy) in path_cells:
-        px, py = cell_to_px(cx, cy, cs)
-        for dy in range(-t, t + 1):
-            for dx in range(-t, t + 1):
-                nx, ny = px + dx, py + dy
+        print(f"    (no path for {out.name})"); return
+    img    = env.pixels_copy()
+    cs, t  = env.cs, 2
+    h, w   = img.shape[:2]
+    for cx, cy in path_cells:
+        px2, py2 = cell_to_px(cx, cy, cs)
+        for dy2 in range(-t, t + 1):
+            for dx2 in range(-t, t + 1):
+                nx, ny = px2 + dx2, py2 + dy2
                 if 0 <= nx < w and 0 <= ny < h:
                     img[ny, nx] = [255, 0, 200]
     Image.fromarray(img).save(out)
-    print(f"    Saved → {out.name}")
+    print(f"    Saved -> {out.name}")
 
-
-def _save_map_overlay(env: MazeEnvironment, agent: QLearningAgent, out: Path):
-    """Overlay the agent's discovered map (death/confusion/teleport cells)."""
-    img  = Image.fromarray(env.pixels_copy)
+def save_map_img(env: MazeEnv, agent: Agent, out: Path):
+    img  = Image.fromarray(env.pixels_copy())
     draw = ImageDraw.Draw(img)
-    cs   = env.cell_size
+    cs   = env.cs
     r    = max(2, cs // 4)
-    for (cx, cy), ctype in agent.known_map.items():
-        px, py = cell_to_px(cx, cy, cs)
+    for (cx, cy), ctype in agent.known.items():
+        px2, py2 = cell_to_px(cx, cy, cs)
         if ctype == "death":
-            draw.ellipse([px-r, py-r, px+r, py+r],
+            draw.ellipse([px2-r, py2-r, px2+r, py2+r],
                          fill=(255, 60, 0), outline=(160, 0, 0))
         elif ctype == "confusion":
-            draw.rectangle([px-r, py-r, px+r, py+r],
-                           fill=(160, 0, 220), outline=(80, 0, 140))
-        elif ctype in ("teleport", "teleport_dest"):
-            draw.ellipse([px-r, py-r, px+r, py+r],
-                         fill=(0, 200, 80), outline=(255, 255, 255))
+            draw.rectangle([px2-r, py2-r, px2+r, py2+r], fill=(160, 0, 220))
+        elif ctype == "teleport":
+            draw.ellipse([px2-r, py2-r, px2+r, py2+r], fill=(0, 200, 80))
     img.save(out)
-    print(f"    Saved → {out.name}")
+    print(f"    Saved -> {out.name}")
 
-
-def _save_learning_curve(all_stats: list, out: Path):
-    """Save a learning-curve chart (success rate + death rate) as a PNG."""
+def save_curve(stats: list, out: Path):
     W, H, M = 840, 440, 65
-    n       = len(all_stats)
-    if n < 2:
-        return
-
+    n = len(stats)
+    if n < 2: return
     img  = Image.new("RGB", (W, H), (255, 255, 255))
     draw = ImageDraw.Draw(img)
-    pw   = W - 2 * M
-    ph   = H - 2 * M
-    window = 10
+    pw, ph = W - 2*M, H - 2*M
+    win = 10
 
-    def rolling_sr(i):
-        chunk = all_stats[max(0, i - window + 1): i + 1]
-        return sum(s.success for s in chunk) / len(chunk)
+    def roll_sr(i):
+        ch = stats[max(0, i-win+1):i+1]
+        return sum(s["success"] for s in ch) / len(ch)
 
-    def rolling_dr(i):
-        chunk  = all_stats[max(0, i - window + 1): i + 1]
-        td = sum(s.deaths for s in chunk)
-        tt = sum(s.turns  for s in chunk)
-        return min(1.0, (td / max(1, tt)) * 20)   # scaled ×20 for visibility
+    def roll_dr(i):
+        ch = stats[max(0, i-win+1):i+1]
+        td = sum(s["deaths"] for s in ch)
+        tt = sum(s["turns"]  for s in ch)
+        return min(1.0, (td / max(1, tt)) * 20)
 
-    sr_vals = [rolling_sr(i) for i in range(n)]
-    dr_vals = [rolling_dr(i) for i in range(n)]
+    sr_v = [roll_sr(i) for i in range(n)]
+    dr_v = [roll_dr(i) for i in range(n)]
 
     def pt(i, v):
-        x = M + int(i * pw / max(1, n - 1))
-        y = H - M - int(v * ph)
-        return x, y
+        return M + int(i * pw / max(1, n-1)), H - M - int(v * ph)
 
-    # Grid lines
-    draw.rectangle([M, M, W - M, H - M], outline=(0, 0, 0), width=2)
+    draw.rectangle([M, M, W-M, H-M], outline=(0, 0, 0), width=2)
     for v in (0.25, 0.5, 0.75, 1.0):
-        y = H - M - int(v * ph)
-        draw.line([M, y, W - M, y], fill=(210, 210, 210), width=1)
-        draw.text((M - 40, y - 7), f"{v:.0%}", fill=(80, 80, 80))
-
-    # Series
+        y2 = H - M - int(v * ph)
+        draw.line([M, y2, W-M, y2], fill=(210, 210, 210))
+        draw.text((M - 40, y2 - 7), f"{v:.0%}", fill=(80, 80, 80))
     for i in range(1, n):
-        draw.line([*pt(i-1, sr_vals[i-1]), *pt(i, sr_vals[i])],
-                  fill=(30, 100, 200), width=2)
-    for i in range(1, n):
-        draw.line([*pt(i-1, dr_vals[i-1]), *pt(i, dr_vals[i])],
-                  fill=(200, 60, 0), width=2)
+        draw.line([*pt(i-1, sr_v[i-1]), *pt(i, sr_v[i])], fill=(30, 100, 200), width=2)
+        draw.line([*pt(i-1, dr_v[i-1]), *pt(i, dr_v[i])], fill=(200, 60, 0),  width=2)
 
-    # Labels
-    draw.text((M, M - 20),
-              "Learning Curve — maze-alpha training  (rolling 10-ep window)",
-              fill=(0, 0, 0))
-    draw.text((W // 2 - 40, H - M + 12), f"Episode  (1 – {n})", fill=(0, 0, 0))
+    draw.text((M, M-20),
+              "Learning Curve -- maze-alpha training (10-ep window)", fill=(0,0,0))
+    draw.text((W//2-40, H-M+12), f"Episode (1-{n})", fill=(0, 0, 0))
     lx = W - M - 170
-    draw.rectangle([lx, M + 10, lx + 14, M + 20], fill=(30, 100, 200))
-    draw.text((lx + 18, M + 10), "Success Rate",      fill=(0, 0, 0))
-    draw.rectangle([lx, M + 32, lx + 14, M + 42], fill=(200, 60, 0))
-    draw.text((lx + 18, M + 32), "Death Rate (×20)",  fill=(0, 0, 0))
-
+    draw.rectangle([lx, M+10, lx+14, M+20], fill=(30,100,200))
+    draw.text((lx+18, M+10), "Success Rate",     fill=(0,0,0))
+    draw.rectangle([lx, M+32, lx+14, M+42], fill=(200,60,0))
+    draw.text((lx+18, M+32), "Death Rate (x20)", fill=(0,0,0))
     img.save(out)
-    print(f"    Saved → {out.name}")
+    print(f"    Saved -> {out.name}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  PER-MAZE RUNNER  (wraps environment + agent + visualisation)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def run_maze_phase(
-        maze_path: Path,
-        agent: QLearningAgent,
-        n_ep: int,
-        train: bool,
-        label: str,
-        is_gamma: bool = False,
-        train_stats_for_LE: list | None = None,
-        out_dir: Path | None = None,
-) -> tuple:
-    """Load maze, run episodes, report metrics, save output images."""
-    print(f"\n{'═'*55}")
+# ════════════════════════════════════════════════════════
+#  PHASE RUNNER
+# ════════════════════════════════════════════════════════
+def run_phase(path: Path, agent: Agent, n: int, train: bool,
+              label: str, gamma_mode: bool = False,
+              train_stats: list | None = None) -> tuple:
+    print(f"\n{'='*52}")
     print(f"  {label}")
-    print(f"{'═'*55}")
+    print(f"{'='*52}")
+    env   = MazeEnv(path, gamma_mode=gamma_mode)
+    stats = run_episodes(env, agent, n, train, label)
+    m     = report_metrics(stats, agent, env, label, train_stats)
 
-    env = MazeEnvironment(maze_path, is_gamma=is_gamma)
-    agent._hint = env.num_free_cells
-    agent._replan_attempts  = 0
-    agent._replan_successes = 0
+    stem = path.stem
+    ctx  = path.parent.name
+    tag  = "train" if train else "test"
 
-    stats   = run_episodes(env, agent, n_ep, train=train, label=label)
-    metrics = report_metrics(stats, agent, env, label,
-                             train_stats=train_stats_for_LE)
-
-    stem     = maze_path.stem
-    ctx      = maze_path.parent.name          # e.g. "maze-alpha"
-    tag      = "train" if train else "test"
-    save_dir = out_dir if out_dir is not None else maze_path.parent
     if agent.best_path:
-        _save_path_image(env, agent.best_path,
-                         save_dir / f"{stem}_{ctx}_rl_{tag}_solved.png")
-    _save_map_overlay(env, agent,
-                      save_dir / f"{stem}_{ctx}_rl_{tag}_map.png")
-
-    return stats, metrics, env
+        save_path_img(env, agent.best_path,
+                      RESULTS / f"{stem}_{ctx}_rl_{tag}_solved.png")
+    save_map_img(env, agent, RESULTS / f"{stem}_{ctx}_rl_{tag}_map.png")
+    return stats, m, env
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  MAIN
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════
 def main():
-    print("\n" + "═"*55)
-    print("  COSC 4368 — Final Maze  |  Q-Learning Agent")
-    print("  Method: Tabular Q-Learning + BFS exploration")
-    print("═"*55)
-    print(f"  TRAIN={TRAIN_EPISODES}ep  TEST={TEST_EPISODES}ep  "
-          f"MAX_TURNS={MAX_TURNS}  α={ALPHA}  γ={GAMMA_RL}  "
-          f"ε {EPS_START}→{EPS_END} (×{EPS_DECAY}/ep)")
+    print("\n" + "="*52)
+    print("  COSC 4368 -- Maze Solver  |  Group 5")
+    print("  Q-Learning + BFS exploration")
+    print("="*52)
+    print(f"  PRETRAIN={PRETRAIN_EPISODES}  TRAIN={TRAIN_EPISODES}  TEST={TEST_EPISODES}  MAX_TURNS={MAX_TURNS}")
+    print(f"  LR={LR}  GAMMA={GAMMA_RL}  e {EPS_START}->{EPS_END} (x{EPS_DECAY}/ep)")
 
     t0 = time.time()
+    RESULTS.mkdir(exist_ok=True)
 
-    RESULTS_DIR = _HERE / "Results"
-    RESULTS_DIR.mkdir(exist_ok=True)
+    # 0 -- Pre-train on blank maze-alpha (MAZE_0) to learn layout without hazards
+    agent_pre = Agent()
+    _, _, _ = run_phase(
+        MAZE_ALPHA_BLANK, agent_pre, PRETRAIN_EPISODES,
+        train=True, label="MAZE-ALPHA  Pre-train (blank)")
 
-    # ── 1. TRAIN on maze-alpha ────────────────────────────────────────────────
-    agent_train = QLearningAgent()
-    train_stats, _, _ = run_maze_phase(
+    # 1 -- Train on maze-alpha (with hazards), warm-started from pre-training
+    agent_train = transfer(agent_pre, eps=agent_pre.epsilon)
+    train_stats, _, _ = run_phase(
         MAZE_ALPHA, agent_train, TRAIN_EPISODES,
-        train=True, label="MAZE-ALPHA  Training", out_dir=RESULTS_DIR)
+        train=True, label="MAZE-ALPHA  Training")
 
-    _save_learning_curve(train_stats, RESULTS_DIR / "learning_curve_alpha.png")
+    save_curve(train_stats, RESULTS / "learning_curve_alpha.png")
 
-    # ── 2. TEST maze-alpha (transfer Q-table + map; no new training) ─────────
-    agent_at           = QLearningAgent()
-    agent_at.q_table   = agent_train.q_table.copy()
-    agent_at.known_map = dict(agent_train.known_map)
-    agent_at._danger   = set(agent_train._danger)
-    agent_at._goal_cell  = agent_train._goal_cell
-    agent_at._start_cell = agent_train._start_cell
-    agent_at.best_path   = agent_train.best_path
-    agent_at.best_turns  = agent_train.best_turns
-    agent_at._tele_map   = dict(agent_train._tele_map)
-    agent_at._blocked    = set(agent_train._blocked)
-    agent_at.epsilon     = EPS_END   # minimal exploration — exploit learned policy
-
-    test_a_stats, test_a_m, _ = run_maze_phase(
+    # 2 -- Test maze-alpha (Q-table + map transferred, no retraining)
+    agent_at = transfer(agent_train, eps=EPS_END)
+    test_a, _, _ = run_phase(
         MAZE_ALPHA, agent_at, TEST_EPISODES,
-        train=False, label="MAZE-ALPHA  Test (no retraining)",
-        train_stats_for_LE=train_stats, out_dir=RESULTS_DIR)
+        train=False, label="MAZE-ALPHA  Test",
+        train_stats=train_stats)
 
-    # ── 3. TEST maze-beta (warm-start from alpha; no Q-update, no training) ─────
-    # Goal is at the same position in all mazes. Pre-seeding it lets BFS route
-    # directly to the goal from episode 1 instead of exploring blindly.
-    # Fire pit positions differ in beta, so danger/rot_danger are cleared.
-    agent_b             = QLearningAgent()
-    agent_b.q_table     = agent_train.q_table.copy()
-    agent_b.known_map   = {k: v for k, v in agent_train.known_map.items()
-                           if v != "death"}
-    agent_b._goal_cell  = agent_train._goal_cell
-    agent_b._start_cell = agent_train._start_cell
-    agent_b._tele_map   = dict(agent_train._tele_map)
-    agent_b._blocked    = set(agent_train._blocked)
-    agent_b._danger     = set()
-    agent_b._rot_danger = {0: set(), 1: set(), 2: set(), 3: set()}
-    agent_b.epsilon     = EPS_END   # map + goal already known; exploit learned policy
+    # 3 -- Test maze-beta (zero-shot -- DO NOT train)
+    agent_bt = transfer(agent_train, eps=0.15)
+    test_b, _, _ = run_phase(
+        MAZE_BETA, agent_bt, TEST_EPISODES,
+        train=False, label="MAZE-BETA  Test (zero-shot)")
 
-    test_b_stats, test_b_m, _ = run_maze_phase(
-        MAZE_BETA, agent_b, TEST_EPISODES,
-        train=False, label="MAZE-BETA  Test (zero-shot, no training)",
-        out_dir=RESULTS_DIR)
+    # 4 -- Extra credit: maze-gamma (push-pad hazards)
+    agent_gt = transfer(agent_train, eps=0.15)
+    test_g, _, _ = run_phase(
+        MAZE_GAMMA, agent_gt, TEST_EPISODES,
+        train=False, label="MAZE-GAMMA  Test (extra credit)",
+        gamma_mode=True)
 
-    # ── 4. EXTRA CREDIT — maze-gamma ─────────────────────────────────────────
-    print(f"\n{'═'*55}")
-    print("  EXTRA CREDIT: Maze-Gamma (directional push-pad hazards ⬆️⬅️)")
-    print(f"{'═'*55}")
-    agent_g             = QLearningAgent()
-    agent_g.q_table     = agent_train.q_table.copy()
-    agent_g.known_map   = {k: v for k, v in agent_train.known_map.items()
-                           if v != "death"}
-    agent_g._goal_cell  = agent_train._goal_cell
-    agent_g._start_cell = agent_train._start_cell
-    agent_g._tele_map   = dict(agent_train._tele_map)
-    agent_g._blocked    = set(agent_train._blocked)
-    agent_g._danger     = set()
-    agent_g._rot_danger = {0: set(), 1: set(), 2: set(), 3: set()}
-    agent_g.epsilon     = EPS_END
-
-    test_g_stats, test_g_m, _ = run_maze_phase(
-        MAZE_GAMMA, agent_g, TEST_EPISODES,
-        train=False, label="MAZE-GAMMA  Extra Credit (zero-shot)",
-        is_gamma=True, out_dir=RESULTS_DIR)
-
-    # ── Final summary ─────────────────────────────────────────────────────────
+    # Final summary
     elapsed = time.time() - t0
-    print(f"\n{'═'*55}")
-    print(f"  FINAL SUMMARY  ({elapsed:.1f} s total)")
-    print(f"{'═'*55}")
-    print(f"  {'Phase':<22} {'SR':>6}  {'AvgTurns':>9}  {'DeathRate':>10}")
-    print(f"  {'-'*52}")
+    print(f"\n{'='*52}")
+    print(f"  FINAL SUMMARY  ({elapsed:.1f}s)")
+    print(f"  {'Phase':<24} {'SR':>6}  {'AvgTurns':>9}  {'DeathRate':>10}")
+    print(f"  {'-'*50}")
     for lbl, st in [
         ("Alpha Train",      train_stats),
-        ("Alpha Test",       test_a_stats),
-        ("Beta Test",        test_b_stats),
-        ("Gamma (X-credit)", test_g_stats),
+        ("Alpha Test",       test_a),
+        ("Beta  Test",       test_b),
+        ("Gamma (X-credit)", test_g),
     ]:
-        succ = [s for s in st if s.success]
-        SR   = len(succ) / len(st) if st else 0
-        AT   = sum(s.turns for s in succ) / len(succ) if succ else float("inf")
-        DR   = sum(s.deaths for s in st) / max(1, sum(s.turns for s in st))
+        succ = [s for s in st if s["success"]]
+        SR   = len(succ) / len(st) if st else 0.0
+        AT   = sum(s["turns"] for s in succ) / len(succ) if succ else float("inf")
+        DR   = sum(s["deaths"] for s in st) / max(1, sum(s["turns"] for s in st))
         at_s = f"{AT:.0f}" if AT < float("inf") else "N/A"
-        print(f"  {lbl:<22} {SR:>6.1%}  {at_s:>9}  {DR:>10.4f}")
-    print(f"{'═'*55}\n")
-    print("  Output images saved to each maze's Contexts folder.")
-    print("  Learning curve saved to: learning_curve_alpha.png\n")
+        print(f"  {lbl:<24} {SR:>6.1%}  {at_s:>9}  {DR:>10.4f}")
+    print(f"{'='*52}")
+    print("  All outputs -> Results/\n")
 
 
 if __name__ == "__main__":
