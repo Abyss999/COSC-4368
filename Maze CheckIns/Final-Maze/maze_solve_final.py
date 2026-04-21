@@ -22,10 +22,11 @@ from typing import Optional
 # ════════════════════════════════════════════════════════
 #  SETTINGS  <- change freely
 # ════════════════════════════════════════════════════════
-PRETRAIN_EPISODES = 100   # blank maze (MAZE_0) warm-up
-TRAIN_EPISODES = 200
-TEST_EPISODES  = 5
-MAX_TURNS      = 10_000
+PRETRAIN_EPISODES     = 100   # blank maze (MAZE_0) warm-up
+TRAIN_EPISODES        = 200
+TEST_EPISODES         = 5
+TRANSFER_EPISODES     = 20    # beta/gamma zero-shot (more episodes to explore novel layouts)
+MAX_TURNS             = 10_000
 
 LR        = 0.1    # Q-learning rate
 GAMMA_RL  = 0.95   # discount factor
@@ -45,7 +46,8 @@ R_CONFUSED =   -5.0
 # ════════════════════════════════════════════════════════
 GRID = 64           # cells per side
 FREE, WALL = 0, 1
-BRIGHT = 128        # red-channel threshold: > BRIGHT -> free cell
+BRIGHT = 128        # kept for reference; wall detection now uses full RGB
+_WALL_THRESH = 50   # pixel is a wall iff r<50 AND g<50 AND b<50
 
 UP, RIGHT, DOWN, LEFT, WAIT = 0, 1, 2, 3, 4
 N_ACTIONS = 5
@@ -87,8 +89,12 @@ def _load_image(path: Path):
     return px, h, w
 
 def _pixel_grid(px: np.ndarray, h: int, w: int) -> np.ndarray:
+    # Wall = dark pixel (r<50 AND g<50 AND b<50); avoids misclassifying colored hazards as free
     g = np.ones((h, w), dtype=np.int8)
-    g[px[:, :, 0] > BRIGHT] = FREE
+    dark = ((px[:, :, 0] < _WALL_THRESH) &
+            (px[:, :, 1] < _WALL_THRESH) &
+            (px[:, :, 2] < _WALL_THRESH))
+    g[~dark] = FREE
     return g
 
 def _cell_size(w: int, h: int) -> int:
@@ -171,23 +177,28 @@ def _build_adj(px, w, h, cs) -> dict:
     """
     half = cs // 2
 
+    def _is_wall_px(r, c) -> bool:
+        # Dark pixel = wall (all channels below threshold)
+        p = px[r, c]
+        return int(p[0]) < _WALL_THRESH and int(p[1]) < _WALL_THRESH and int(p[2]) < _WALL_THRESH
+
     def wall_between(cx, cy, nx, ny) -> bool:
         if nx == cx + 1:   # moving RIGHT: check 2px at left edge of nx
             by = min(cy * cs + half, h - 1)
-            return (px[by, min(nx*cs,   w-1), 0] <= BRIGHT and
-                    px[by, min(nx*cs+1, w-1), 0] <= BRIGHT)
+            return (_is_wall_px(by, min(nx*cs,   w-1)) and
+                    _is_wall_px(by, min(nx*cs+1, w-1)))
         elif nx == cx - 1: # moving LEFT: check 2px at left edge of cx
             by = min(cy * cs + half, h - 1)
-            return (px[by, min(cx*cs,   w-1), 0] <= BRIGHT and
-                    px[by, min(cx*cs+1, w-1), 0] <= BRIGHT)
+            return (_is_wall_px(by, min(cx*cs,   w-1)) and
+                    _is_wall_px(by, min(cx*cs+1, w-1)))
         elif ny == cy + 1: # moving DOWN: check 2px at top edge of ny
             bx = min(cx * cs + half, w - 1)
-            return (px[min(ny*cs,   h-1), bx, 0] <= BRIGHT and
-                    px[min(ny*cs+1, h-1), bx, 0] <= BRIGHT)
+            return (_is_wall_px(min(ny*cs,   h-1), bx) and
+                    _is_wall_px(min(ny*cs+1, h-1), bx))
         else:              # moving UP: check 2px at top edge of cy
             bx = min(cx * cs + half, w - 1)
-            return (px[min(cy*cs,   h-1), bx, 0] <= BRIGHT and
-                    px[min(cy*cs+1, h-1), bx, 0] <= BRIGHT)
+            return (_is_wall_px(min(cy*cs,   h-1), bx) and
+                    _is_wall_px(min(cy*cs+1, h-1), bx))
 
     adj = {}
     for cy in range(GRID):
@@ -204,7 +215,7 @@ def _build_adj(px, w, h, cs) -> dict:
             adj[(cx, cy)] = nbrs
     return adj
 
-_ADJ_VER = b"v4"   # bump when changing adjacency algorithm to invalidate old caches
+_ADJ_VER = b"v5"   # bumped: wall detection now uses full RGB instead of red-channel only
 
 def _build_adj_cached(px, pg, w, h, cs, path: Path) -> dict:
     key   = hashlib.md5(pg.tobytes() + _ADJ_VER).hexdigest()
@@ -467,10 +478,16 @@ class Agent:
             fa = self._frontier_actions(pos)
             return random.choice(fa) if fa else random.randint(0, N_ACTIONS - 1)
 
-        # Phase 2: goal known -> BFS to goal through safe known cells
-        if self.goal is not None:
+        # Phase 2: goal known -> BFS to goal through safe known cells.
+        # Try passable-gated BFS first (safe exploitation of confirmed edges).
+        # If that finds nothing (passable gaps or zero-shot empty map), fall back
+        # to blocked-only BFS so the agent can still navigate toward the goal.
+        if self.goal is not None and self.goal in self.known:
             safe = {k: v for k, v in self.known.items() if k not in self.danger}
             path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele, self.passable)
+            if not path and self.passable:
+                # passable-gated BFS failed; retry without passable constraint
+                path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele)
             if len(path) > 1:
                 return self._dir(pos, path[1])
 
@@ -501,21 +518,19 @@ class Agent:
                 and (pos, (cx + dx, cy + dy)) not in self.blocked]
 
     def _nearest_frontier(self, pos: tuple):
-        # Is current cell already on a frontier?
-        for act, (dx, dy) in DELTAS.items():
-            if act == WAIT: continue
-            nb = (pos[0] + dx, pos[1] + dy)
-            if (0 <= nb[0] < GRID and 0 <= nb[1] < GRID
-                    and nb not in self.known
-                    and (pos, nb) not in self.blocked):
-                return pos, nb
-
         # Frontier BFS uses only blocked-gating (not passable).
         # passable is for goal-routing (exploit known safe paths).
         # Exploration must be able to reach new frontiers even through unconfirmed
         # known cells -- otherwise the agent gets trapped in its passable island.
-        queue   = deque([pos])
-        visited = {pos}
+        #
+        # Goal-ward bias: collect ALL reachable frontier edges, then pick the one
+        # whose unexplored neighbor is closest to the goal (Manhattan distance).
+        # This pulls exploration toward the goal during zero-shot transfer phases
+        # where the agent must discover a path in very few episodes.
+        queue    = deque([pos])
+        visited  = {pos}
+        frontier = []   # (manhattan_to_goal, hop_count, cur, nb)
+        hop      = {pos: 0}
         while queue:
             cur    = queue.popleft()
             cx, cy = cur
@@ -527,14 +542,27 @@ class Agent:
                     continue
                 visited.add(nb)
                 if nb not in self.known:
-                    return cur, nb          # frontier found
-                if nb not in self.danger and self.known[nb] != "wall":
+                    # Goal-ward bias: prefer frontiers closer to goal when the agent
+                    # has never reached the goal yet (zero-shot / early exploration).
+                    # Once goal is known from a successful episode, passable-gated BFS
+                    # handles routing; frontier BFS should cover the full map instead.
+                    if self.goal is not None and self.best_turns >= 999_999:
+                        md = abs(nb[0] - self.goal[0]) + abs(nb[1] - self.goal[1])
+                    else:
+                        md = 0
+                    frontier.append((md, hop[cur] + 1, cur, nb))
+                elif nb not in self.danger and self.known[nb] != "wall":
+                    hop[nb] = hop[cur] + 1
                     queue.append(nb)
             if cur in self.tele:
                 dest = self.tele[cur]
                 if dest not in visited and dest in self.known and dest not in self.danger:
                     visited.add(dest)
+                    hop[dest] = hop[cur] + 1
                     queue.append(dest)
+        if frontier:
+            _, _, best_cur, best_nb = min(frontier)
+            return best_cur, best_nb
         return None, None
 
     # ── Q-table update ─────────────────────────────────────────────────────────
@@ -546,7 +574,7 @@ class Agent:
         s[action] += LR * (td - float(s[action]))
 
     # ── Observe TurnResult and update internal map ─────────────────────────────
-    def observe(self, prev: tuple, action: int, tr: TurnResult):
+    def observe(self, prev: tuple, action: int, tr: TurnResult, prev_confused: bool = False):
         """Update internal map from TurnResult only. Never reads MazeEnv directly."""
         self._ep_turns += 1
         self._ep_tc    += 1
@@ -554,8 +582,12 @@ class Agent:
         rot = self._rot_slot()
 
         if tr.is_dead:
-            # Infer fire-pit location: moved from prev in direction action
-            if tr.wall_hits == 0:
+            # Fire-pit inference is only reliable when the intended action direction
+            # actually equals the attempted move. Confusion reverses the action, and
+            # gamma push pads displace the agent after the move -- in either case the
+            # raw `action` no longer identifies the fatal cell. Skip inference in
+            # those cases rather than polluting the danger map with bad entries.
+            if tr.wall_hits == 0 and not prev_confused and not tr.pushed:
                 dx, dy = DELTAS.get(action, (0, 0))
                 pit    = (prev[0] + dx, prev[1] + dy)
                 if 0 <= pit[0] < GRID and 0 <= pit[1] < GRID:
@@ -580,29 +612,37 @@ class Agent:
         elif tr.teleported:
             self.known.setdefault(cur, "teleport")
             # Infer the pad cell stepped onto before being teleported
-            if tr.wall_hits == 0:
+            if tr.wall_hits == 0 and not prev_confused:
                 dx, dy = DELTAS.get(action, (0, 0))
                 pad    = (prev[0] + dx, prev[1] + dy)
                 if 0 <= pad[0] < GRID and 0 <= pad[1] < GRID:
                     self.known.setdefault(pad, "teleport")
                     self.tele[pad] = cur
-        elif tr.is_confused:
-            self.known.setdefault(cur, "confusion")
+        elif tr.is_confused and not prev_confused:
+            # Only label confusion on actual trap entry (transition not-confused -> confused);
+            # merely passing through a cell while under ongoing confusion must not tag it.
+            self.known[cur] = "confusion"
         else:
             if self.known.get(cur) == "death":
                 self.known[cur] = "free"   # fire rotated away -- cell safe now
-            else:
+            elif self.known.get(cur) != "confusion":
                 self.known.setdefault(cur, "free")
 
-        # Record confirmed traversable edge (cardinal moves only, not teleport jumps)
-        if tr.wall_hits == 0 and not tr.is_dead:
+        # Record confirmed traversable edge. An actually-walked cardinal step proves
+        # the edge is wall-free in BOTH directions (walls are symmetric), so record
+        # both (prev,cur) and (cur,prev). Previously one-way recording blocked BFS
+        # from planning reverse traversal and produced long detours.
+        if tr.wall_hits == 0 and not tr.is_dead and not tr.pushed:
             dx2 = cur[0] - prev[0]
             dy2 = cur[1] - prev[1]
             if abs(dx2) + abs(dy2) == 1:
                 self.passable.add((prev, cur))
+                self.passable.add((cur, prev))
 
-        # Record impassable edge from wall hit (bidirectional -- walls block both ways)
-        if tr.wall_hits > 0:
+        # Record impassable edge from wall hit (bidirectional -- walls block both ways).
+        # Skip when confused: effective direction is reversed, so `action` doesn't
+        # identify the blocked edge.
+        if tr.wall_hits > 0 and not prev_confused:
             dx, dy = DELTAS.get(action, (0, 0))
             target = (prev[0] + dx, prev[1] + dy)
             if 0 <= target[0] < GRID and 0 <= target[1] < GRID:
@@ -612,10 +652,17 @@ class Agent:
     def record_success(self, turns: int):
         if turns < self.best_turns:
             self.best_turns = turns
-            # Use BFS over confirmed-passable edges to get clean shortest path
+            # Try passable-gated BFS first (guaranteed wall-safe shortest path).
+            # Fall back to blocked-only BFS (uses all known cells, still respects walls).
+            # Only use the raw walked path if both BFS variants fail.
             clean = bfs(self.known, self.start, self.goal,
                         set(), self.blocked, self.tele, self.passable)
-            self.best_path = clean if len(clean) > 1 else list(self._ep_path)
+            if len(clean) > 1:
+                self.best_path = clean
+            else:
+                clean2 = bfs(self.known, self.start, self.goal,
+                             set(), self.blocked, self.tele)
+                self.best_path = clean2 if len(clean2) > 1 else list(self._ep_path)
 
     def decay_epsilon(self):
         self.epsilon = max(EPS_END, self.epsilon * EPS_DECAY)
@@ -707,7 +754,7 @@ def run_episodes(env: MazeEnv, agent: Agent, n: int,
             if train:
                 agent.update_q(pos, prev_conf, action, reward, tr)
 
-            agent.observe(pos, action, tr)
+            agent.observe(pos, action, tr, prev_confused=prev_conf)
             pos = agent._pos   # use agent's pos (handles death respawn correctly)
 
             if tr.is_goal_reached:
@@ -715,7 +762,14 @@ def run_episodes(env: MazeEnv, agent: Agent, n: int,
                 break
 
         all_stats.append(agent.ep_stats)
-        agent.decay_epsilon()
+        if train:
+            agent.decay_epsilon()
+        elif agent.goal in agent._ep_cells:
+            # Goal was found this episode -- path is now in passable.
+            # Ratchet epsilon down so future episodes exploit the discovered path
+            # rather than wandering randomly. Q-table is not updated so this is
+            # not policy drift; it only controls BFS-vs-explore balance.
+            agent.epsilon = max(EPS_END, agent.epsilon * 0.5)
 
         if (ep + 1) % 20 == 0 or ep == n - 1:
             recent = all_stats[-10:]
@@ -879,7 +933,12 @@ def run_phase(path: Path, agent: Agent, n: int, train: bool,
 # ════════════════════════════════════════════════════════
 #  MAIN
 # ════════════════════════════════════════════════════════
+RANDOM_SEED = 42
+
 def main():
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
     print("\n" + "="*52)
     print("  COSC 4368 -- Maze Solver  |  Group 5")
     print("  Q-Learning + BFS exploration")
@@ -917,13 +976,13 @@ def main():
     # so the agent must explore more to build a valid passable map for beta.
     agent_bt = transfer(agent_train, eps=0.30)
     test_b, _, _ = run_phase(
-        MAZE_BETA, agent_bt, TEST_EPISODES,
+        MAZE_BETA, agent_bt, TRANSFER_EPISODES,
         train=False, label="MAZE-BETA  Test (zero-shot)")
 
     # 4 -- Extra credit: maze-gamma (push-pad hazards)
     agent_gt = transfer(agent_train, eps=0.30)
     test_g, _, _ = run_phase(
-        MAZE_GAMMA, agent_gt, TEST_EPISODES,
+        MAZE_GAMMA, agent_gt, TRANSFER_EPISODES,
         train=False, label="MAZE-GAMMA  Test (extra credit)",
         gamma_mode=True)
 
