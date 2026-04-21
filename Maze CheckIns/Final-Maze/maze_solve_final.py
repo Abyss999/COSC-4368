@@ -22,11 +22,10 @@ from typing import Optional
 # ════════════════════════════════════════════════════════
 #  SETTINGS  <- change freely
 # ════════════════════════════════════════════════════════
-PRETRAIN_EPISODES     = 100   # blank maze (MAZE_0) warm-up
-TRAIN_EPISODES        = 200
-TEST_EPISODES         = 5
-TRANSFER_EPISODES     = 20    # beta/gamma zero-shot (more episodes to explore novel layouts)
-MAX_TURNS             = 10_000
+PRETRAIN_EPISODES = 100   # blank maze (MAZE_0) warm-up
+TRAIN_EPISODES = 200
+TEST_EPISODES  = 5
+MAX_TURNS      = 10_000
 
 LR        = 0.1    # Q-learning rate
 GAMMA_RL  = 0.95   # discount factor
@@ -423,7 +422,8 @@ class Agent:
     """
 
     def __init__(self):
-        self.epsilon = EPS_START
+        self.epsilon    = EPS_START
+        self.goal_ward  = False   # set True for zero-shot phases to bias frontier toward goal
 
         # Persistent across all episodes
         self.q          = np.zeros((GRID, GRID, 2, N_ACTIONS), dtype=np.float32)
@@ -479,17 +479,35 @@ class Agent:
             return random.choice(fa) if fa else random.randint(0, N_ACTIONS - 1)
 
         # Phase 2: goal known -> BFS to goal through safe known cells.
-        # Try passable-gated BFS first (safe exploitation of confirmed edges).
-        # If that finds nothing (passable gaps or zero-shot empty map), fall back
-        # to blocked-only BFS so the agent can still navigate toward the goal.
+        # Zero-shot mode: use blocked-only BFS (shortest path through full known map).
+        #   Passable edges from a first-pass random walk are a long circuitous route;
+        #   blocked-only BFS finds a shorter path through already-mapped cells.
+        # Trained mode: use passable-gated BFS (confirmed wall-safe edges only) first,
+        #   falling back to blocked-only if passable gaps break connectivity.
         if self.goal is not None and self.goal in self.known:
-            safe = {k: v for k, v in self.known.items() if k not in self.danger}
-            path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele, self.passable)
-            if not path and self.passable:
-                # passable-gated BFS failed; retry without passable constraint
-                path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele)
+            if self.goal_ward:
+                # Zero-shot: avoid only cells dangerous at ALL rotation slots (always-on fire).
+                # Single-slot fire can be waited out; always-on fire is truly impassable.
+                always_danger = (self.rot_danger[0] & self.rot_danger[1] &
+                                 self.rot_danger[2] & self.rot_danger[3])
+                safe = {k: v for k, v in self.known.items() if k not in always_danger}
+                path = bfs(safe, pos, self.goal, always_danger, self.blocked, self.tele)
+                if not path:
+                    # No path even through always-danger-free map -- allow current-slot
+                    # danger cells too and accept the death/retry cost.
+                    path = bfs(self.known, pos, self.goal, set(), self.blocked, self.tele)
+            else:
+                safe = {k: v for k, v in self.known.items() if k not in self.danger}
+                path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele, self.passable)
+                if not path and self.passable:
+                    path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele)
             if len(path) > 1:
-                return self._dir(pos, path[1])
+                nxt = path[1]
+                # Fire-dodge: if next step is in current danger, WAIT for rotation.
+                # Fire rotates every 5 turns -- waiting costs 5 turns but avoids death.
+                if self.goal_ward and nxt in self.danger:
+                    return WAIT
+                return self._dir(pos, nxt)
 
         # Phase 1: goal unknown -> BFS to nearest frontier
         # No passable gate: exploration must route through unconfirmed known cells.
@@ -542,11 +560,10 @@ class Agent:
                     continue
                 visited.add(nb)
                 if nb not in self.known:
-                    # Goal-ward bias: prefer frontiers closer to goal when the agent
-                    # has never reached the goal yet (zero-shot / early exploration).
-                    # Once goal is known from a successful episode, passable-gated BFS
-                    # handles routing; frontier BFS should cover the full map instead.
-                    if self.goal is not None and self.best_turns >= 999_999:
+                    # Goal-ward bias: pull exploration toward goal in zero-shot phases
+                    # where the agent has no pre-built passable map. Disabled during
+                    # trained phases (alpha) to preserve broad map coverage.
+                    if self.goal_ward and self.goal is not None:
                         md = abs(nb[0] - self.goal[0]) + abs(nb[1] - self.goal[1])
                     else:
                         md = 0
@@ -975,14 +992,16 @@ def main():
     # Use higher epsilon: alpha Q-values don't generalize to a different wall layout,
     # so the agent must explore more to build a valid passable map for beta.
     agent_bt = transfer(agent_train, eps=0.30)
+    agent_bt.goal_ward = True   # bias frontier exploration toward goal
     test_b, _, _ = run_phase(
-        MAZE_BETA, agent_bt, TRANSFER_EPISODES,
+        MAZE_BETA, agent_bt, TEST_EPISODES,
         train=False, label="MAZE-BETA  Test (zero-shot)")
 
     # 4 -- Extra credit: maze-gamma (push-pad hazards)
     agent_gt = transfer(agent_train, eps=0.30)
+    agent_gt.goal_ward = True   # bias frontier exploration toward goal
     test_g, _, _ = run_phase(
-        MAZE_GAMMA, agent_gt, TRANSFER_EPISODES,
+        MAZE_GAMMA, agent_gt, TEST_EPISODES,
         train=False, label="MAZE-GAMMA  Test (extra credit)",
         gamma_mode=True)
 
