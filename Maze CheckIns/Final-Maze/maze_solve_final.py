@@ -447,6 +447,10 @@ class Agent:
         if self.start is None:
             self.start = start
         self.known.setdefault(start, "free")
+        # Seed goal into known so BFS can aim toward it even before it's explored.
+        # The goal cell coordinate is consistent across all three mazes.
+        if self.goal is not None:
+            self.known.setdefault(self.goal, "goal")
         self.danger = set(self.rot_danger[0])
 
     def _rot_slot(self) -> int:
@@ -471,11 +475,12 @@ class Agent:
                 return self._dir(pos, path[1])
 
         # Phase 1: goal unknown -> BFS to nearest frontier
+        # No passable gate: exploration must route through unconfirmed known cells.
         fc, unk = self._nearest_frontier(pos)
         if fc is not None:
             if fc == pos and unk is not None:
                 return self._dir(pos, unk)
-            path = bfs(self.known, pos, fc, self.danger, self.blocked, self.tele, self.passable)
+            path = bfs(self.known, pos, fc, self.danger, self.blocked, self.tele)
             if len(path) > 1:
                 return self._dir(pos, path[1])
 
@@ -505,6 +510,10 @@ class Agent:
                     and (pos, nb) not in self.blocked):
                 return pos, nb
 
+        # Frontier BFS uses only blocked-gating (not passable).
+        # passable is for goal-routing (exploit known safe paths).
+        # Exploration must be able to reach new frontiers even through unconfirmed
+        # known cells -- otherwise the agent gets trapped in its passable island.
         queue   = deque([pos])
         visited = {pos}
         while queue:
@@ -625,27 +634,44 @@ class Agent:
 # ════════════════════════════════════════════════════════
 #  TRANSFER AGENT (alpha -> beta/gamma)
 # ════════════════════════════════════════════════════════
-def transfer(src: Agent, eps: float) -> Agent:
+def transfer(src: Agent, eps: float, same_maze: bool = False) -> Agent:
     """
-    Clone trained agent for a new maze.
-    Reclassifies alpha death cells as free -- beta/gamma fire is in different
-    positions, so those cells are safe and may be the only path to the goal.
-    Clears blocked edges and danger (beta/gamma may have different wall layout).
+    Clone trained agent for use in another run.
+
+    same_maze=True  (alpha pre-train -> alpha train, or alpha train -> alpha test):
+        Carry over Q-table, known map, passable edges, goal/start.
+        The wall layout is identical so previously confirmed edges remain valid.
+
+    same_maze=False (alpha -> beta/gamma):
+        Carry over Q-table and goal/start (coordinates are the same across all
+        three mazes), but clear known, passable, blocked, tele.
+        Beta/gamma have different wall layouts from alpha -- reusing alpha's
+        passable edges causes BFS to route through walls that exist in
+        beta/gamma but not in alpha.
     """
     dst = Agent()
     dst.q          = src.q.copy()
-    dst.known      = {k: ("free" if v == "death" else v)
-                      for k, v in src.known.items()}
-    dst.goal       = src.goal
-    dst.start      = src.start
-    dst.tele       = dict(src.tele)
-    dst.blocked    = set()
-    dst.passable   = set(src.passable)
+    dst.epsilon    = eps
+
+    if same_maze:
+        dst.known      = {k: ("free" if v == "death" else v)
+                          for k, v in src.known.items()}
+        dst.goal       = src.goal
+        dst.start      = src.start
+        dst.tele       = dict(src.tele)
+        dst.passable   = set(src.passable)
+        dst.blocked    = set()          # reset wall hits; passable is canonical
+        dst.best_path  = list(src.best_path)
+        dst.best_turns = src.best_turns
+    else:
+        # Carry goal/start so BFS knows where to aim even before re-discovering goal.
+        # All three mazes share the same start/goal cell coordinates.
+        dst.goal  = src.goal
+        dst.start = src.start
+        # known, passable, blocked, tele stay empty (Agent() defaults)
+
     dst.danger     = set()
     dst.rot_danger = {0:set(), 1:set(), 2:set(), 3:set()}
-    dst.epsilon    = eps
-    dst.best_path  = list(src.best_path)
-    dst.best_turns = src.best_turns
     return dst
 
 
@@ -871,7 +897,8 @@ def main():
         train=True, label="MAZE-ALPHA  Pre-train (blank)")
 
     # 1 -- Train on maze-alpha (with hazards), warm-started from pre-training
-    agent_train = transfer(agent_pre, eps=agent_pre.epsilon)
+    # same_maze=True: MAZE_0 and MAZE_1 share the same wall layout (MAZE_1 adds hazards only)
+    agent_train = transfer(agent_pre, eps=agent_pre.epsilon, same_maze=True)
     train_stats, _, _ = run_phase(
         MAZE_ALPHA, agent_train, TRAIN_EPISODES,
         train=True, label="MAZE-ALPHA  Training")
@@ -879,20 +906,22 @@ def main():
     save_curve(train_stats, RESULTS / "learning_curve_alpha.png")
 
     # 2 -- Test maze-alpha (Q-table + map transferred, no retraining)
-    agent_at = transfer(agent_train, eps=EPS_END)
+    agent_at = transfer(agent_train, eps=EPS_END, same_maze=True)
     test_a, _, _ = run_phase(
         MAZE_ALPHA, agent_at, TEST_EPISODES,
         train=False, label="MAZE-ALPHA  Test",
         train_stats=train_stats)
 
     # 3 -- Test maze-beta (zero-shot -- DO NOT train)
-    agent_bt = transfer(agent_train, eps=0.15)
+    # Use higher epsilon: alpha Q-values don't generalize to a different wall layout,
+    # so the agent must explore more to build a valid passable map for beta.
+    agent_bt = transfer(agent_train, eps=0.30)
     test_b, _, _ = run_phase(
         MAZE_BETA, agent_bt, TEST_EPISODES,
         train=False, label="MAZE-BETA  Test (zero-shot)")
 
     # 4 -- Extra credit: maze-gamma (push-pad hazards)
-    agent_gt = transfer(agent_train, eps=0.15)
+    agent_gt = transfer(agent_train, eps=0.30)
     test_g, _, _ = run_phase(
         MAZE_GAMMA, agent_gt, TEST_EPISODES,
         train=False, label="MAZE-GAMMA  Test (extra credit)",
