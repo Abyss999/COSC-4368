@@ -22,6 +22,7 @@ from typing import Optional
 # ════════════════════════════════════════════════════════
 #  SETTINGS  <- change freely
 # ════════════════════════════════════════════════════════
+DEBUG_MOVE_VALIDATOR = False   # set True to assert every move is legal under env adjacency
 PRETRAIN_EPISODES = 100   # blank maze (MAZE_0) warm-up
 TRAIN_EPISODES = 200
 TEST_EPISODES  = 5
@@ -424,6 +425,7 @@ class Agent:
     def __init__(self):
         self.epsilon    = EPS_START
         self.goal_ward  = False   # set True for zero-shot phases to bias frontier toward goal
+        self.zero_shot  = False   # set True for beta/gamma test: enables danger-ignoring BFS fallback
 
         # Persistent across all episodes
         self.q          = np.zeros((GRID, GRID, 2, N_ACTIONS), dtype=np.float32)
@@ -501,11 +503,19 @@ class Agent:
                 path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele, self.passable)
                 if not path and self.passable:
                     path = bfs(safe, pos, self.goal, self.danger, self.blocked, self.tele)
+                if not path and self.zero_shot:
+                    # Zero-shot only: all danger-safe paths fail.
+                    # Try routing through always-on fire (all 4 slots) only -- rotating
+                    # fire should be waited out, not walked through.
+                    always_on = (self.rot_danger[0] & self.rot_danger[1] &
+                                 self.rot_danger[2] & self.rot_danger[3])
+                    always_safe = {k: v for k, v in self.known.items() if k not in always_on}
+                    path = bfs(always_safe, pos, self.goal, always_on, self.blocked, self.tele)
             if len(path) > 1:
                 nxt = path[1]
                 # Fire-dodge: if next step is in current danger, WAIT for rotation.
                 # Fire rotates every 5 turns -- waiting costs 5 turns but avoids death.
-                if self.goal_ward and nxt in self.danger:
+                if (self.goal_ward or self.zero_shot) and nxt in self.danger:
                     return WAIT
                 return self._dir(pos, nxt)
 
@@ -761,7 +771,24 @@ def run_episodes(env: MazeEnv, agent: Agent, n: int,
         for turn in range(MAX_TURNS):
             prev_conf = agent._confused
             action    = agent.choose(pos)
+
+            if DEBUG_MOVE_VALIDATOR and action != WAIT:
+                eff = REVERSE[action] if prev_conf else action
+                adj_nbrs = env._adj.get(pos, {})
+                expected = adj_nbrs.get(eff)
+                # Pre-validate: if eff not in adj_nbrs the env will bounce (wall_hits=1)
+
             tr        = env.step(action)
+
+            if DEBUG_MOVE_VALIDATOR and action != WAIT and not tr.is_dead and not tr.pushed:
+                eff = REVERSE[action] if prev_conf else action
+                adj_nbrs = env._adj.get(pos, {})
+                expected = adj_nbrs.get(eff, pos)
+                if not tr.teleported and tr.wall_hits == 0:
+                    assert tr.current_position == expected, (
+                        f"ILLEGAL MOVE ep={ep} turn={turn}: from={pos} action={action} "
+                        f"eff={eff} expected={expected} got={tr.current_position}"
+                    )
 
             # Reward shaping
             reward = R_STEP
@@ -795,6 +822,15 @@ def run_episodes(env: MazeEnv, agent: Agent, n: int,
             # episodes exploit the discovered path.  Skipped in explore mode
             # (pre-exploration passes) so epsilon stays high for full coverage.
             agent.epsilon = max(EPS_END, agent.epsilon * 0.5)
+
+        if not train and n <= 10:
+            # Per-episode detail for short test runs
+            s = all_stats[-1]
+            print(f"    [{label[:18]:<18}] ep {ep+1:>2}  "
+                  f"{'SUCCESS' if s['success'] else 'FAIL   '}  "
+                  f"turns={s['turns']:>5}  deaths={s['deaths']}  "
+                  f"map={len(agent.known)}/{env.free_count}  "
+                  f"passable={len(agent.passable)}")
 
         if (ep + 1) % 20 == 0 or ep == n - 1:
             recent = all_stats[-10:]
@@ -1012,6 +1048,7 @@ def main():
 
     agent_bt = transfer(agent_bpre, eps=EPS_END, same_maze=True)
     agent_bt.goal_ward = False
+    agent_bt.zero_shot = True   # enables danger-ignoring fallback BFS when all safe paths fail
     test_b, _, _ = run_phase(
         MAZE_BETA, agent_bt, TEST_EPISODES,
         train=False, label="MAZE-BETA  Test (zero-shot)")
