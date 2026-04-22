@@ -165,11 +165,31 @@ def _detect_hazards(px_arr, h, w) -> dict:
         lambda r, g, b: (r > 100) & (r < 210) & (b > 130) & (g < 100), min_sz=30))
     red    = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 190) & (g < 80) & (b < 80), min_sz=80))
-    # Teleport pads are bidirectional: stepping on either pad teleports to the other.
-    tp = {}
+
+    def _is_square_pad(px_centroid):
+        """Square-star exit pads have a white star icon in the center; spheres do not."""
+        px_x, px_y = px_centroid
+        csize = w // GRID
+        cell_x, cell_y = px_x // csize, px_y // csize
+        patch = px_arr[cell_y*csize:(cell_y+1)*csize, cell_x*csize:(cell_x+1)*csize]
+        inner = patch[5:csize-5, 5:csize-5]
+        white = int(((inner[:,:,0] > 220) & (inner[:,:,1] > 220) & (inner[:,:,2] > 220)).sum())
+        return white >= 10
+
     def _add_pair(a, b):
-        tp[a] = b
-        tp[b] = a
+        # If one pad is a square-star exit, only map sphere->square (one-way).
+        # Square exit pads should not re-teleport the agent back on arrival.
+        # If both are spheres, map bidirectionally.
+        a_sq, b_sq = _is_square_pad(a), _is_square_pad(b)
+        if a_sq and not b_sq:
+            tp[b] = a          # sphere b -> square a
+        elif b_sq and not a_sq:
+            tp[a] = b          # sphere a -> square b
+        else:
+            tp[a] = b          # both spheres: bidirectional
+            tp[b] = a
+
+    tp = {}
     if len(green)       >= 2: _add_pair(green[0],       green[1])
     if len(purple)      >= 2: _add_pair(purple[0],      purple[1])
     if len(yellow_pads) >= 2: _add_pair(yellow_pads[0], yellow_pads[1])
