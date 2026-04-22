@@ -135,25 +135,45 @@ def _detect_hazards(px_arr, h, w) -> dict:
     fire = _clusters(px_arr, h, w,
         lambda r, g, b: (r > 180) & (g > 70) & (g < 175) & (b < 100))
 
-    # Confusion traps: bright yellow emoji
-    conf = _clusters(px_arr, h, w,
-        lambda r, g, b: (r > 210) & (g > 160) & (b < 70) & (np.abs(r - g) < 70),
-        min_sz=50)
+    # Yellow-hue clusters: solid pads (~114px, no embedded face features) are
+    # teleport pads; smaller clusters (~48-51px) with embedded dark face features
+    # (X-eyes / zigzag mouth) are confusion-trap emojis. Size cleanly separates them.
+    _yr = px_arr[:, :, 0].astype(np.int32)
+    _yg = px_arr[:, :, 1].astype(np.int32)
+    _yb = px_arr[:, :, 2].astype(np.int32)
+    _ymask = (_yr > 190) & (_yg > 140) & (_yb < 90) & (_yr > _yg + 25)
+    _ylab, _yn = ndimage.label(_ymask)
+    yellow_pads = []
+    conf        = []
+    for _i in range(1, _yn + 1):
+        _pts = np.argwhere(_ylab == _i)
+        _sz  = len(_pts)
+        if _sz < 30:
+            continue
+        _cy, _cx = _pts.mean(0).astype(int)
+        _cell = (int(_cx), int(_cy))
+        if _sz >= 80:
+            yellow_pads.append(_cell)
+        else:
+            conf.append(_cell)
+    yellow_pads.sort()
 
-    # Teleport pads -- pair colour families by sorted order
+    # Teleport pads -- pair colour families by sorted order.
     green  = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (g > 170) & (r < 140) & (b < 160), min_sz=30))
     purple = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 100) & (r < 210) & (b > 130) & (g < 100), min_sz=30))
-    yellow = sorted(_clusters(px_arr, h, w,
-        lambda r, g, b: (r > 190) & (g > 140) & (b < 90) & (r > g + 25), min_sz=30))
     red    = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 190) & (g < 80) & (b < 80), min_sz=80))
+    # Teleport pads are bidirectional: stepping on either pad teleports to the other.
     tp = {}
-    if len(green)  >= 2: tp[green[0]]  = green[1]
-    if len(purple) >= 2: tp[purple[0]] = purple[1]
-    if len(yellow) >= 2: tp[yellow[0]] = yellow[1]
-    if len(red)    >= 2: tp[red[0]]    = red[1]
+    def _add_pair(a, b):
+        tp[a] = b
+        tp[b] = a
+    if len(green)       >= 2: _add_pair(green[0],       green[1])
+    if len(purple)      >= 2: _add_pair(purple[0],      purple[1])
+    if len(yellow_pads) >= 2: _add_pair(yellow_pads[0], yellow_pads[1])
+    if len(red)         >= 2: _add_pair(red[0],         red[1])
 
     # Gamma push pads: teal/blue arrows
     all_blue = _clusters(px_arr, h, w,
@@ -255,7 +275,6 @@ class MazeEnv:
         self._goal  = px_to_cell(*gp, cs)
 
         hz = _detect_hazards(px, h, w)
-        self._base_fire   = hz["fire"]
         self._conf_cells  = frozenset(px_to_cell(x, y, cs) for x, y in hz["confusion"])
         self._tele: dict  = {
             px_to_cell(sx, sy, cs): px_to_cell(dx2, dy2, cs)
@@ -263,6 +282,13 @@ class MazeEnv:
         }
         self._push_up  = frozenset(px_to_cell(x, y, cs) for x, y in hz["push_up"])
         self._push_lft = frozenset(px_to_cell(x, y, cs) for x, y in hz["push_left"])
+        # Strip teleport pads and confusion cells from fire — yellow pads share hue
+        # with fire and would otherwise cause instant death instead of teleporting.
+        _non_fire = self._conf_cells | set(self._tele.keys())
+        self._base_fire = [
+            (x, y) for (x, y) in hz["fire"]
+            if px_to_cell(x, y, cs) not in _non_fire
+        ]
 
         self._free_count = max(1, sum(1 for nb in self._adj.values() if nb))
 
@@ -336,10 +362,10 @@ class MazeEnv:
         # Teleport
         tele = False
         if self._pos in self._tele:
-            self._pos = self._tele[self._pos]
-            tele = True
-            if self._pos in self._tele:      # chained teleport
-                self._pos = self._tele[self._pos]
+            dest = self._tele[self._pos]
+            if dest != self._pos:   # guard against degenerate self-loop
+                self._pos = dest
+                tele = True
 
         # Confusion trap
         if self._pos in self._conf_cells:
@@ -636,15 +662,6 @@ class Agent:
             self.known[cur] = "goal"
             if self.goal is None:
                 self.goal = cur
-        elif tr.teleported:
-            self.known.setdefault(cur, "teleport")
-            # Infer the pad cell stepped onto before being teleported
-            if tr.wall_hits == 0 and not prev_confused:
-                dx, dy = DELTAS.get(action, (0, 0))
-                pad    = (prev[0] + dx, prev[1] + dy)
-                if 0 <= pad[0] < GRID and 0 <= pad[1] < GRID:
-                    self.known.setdefault(pad, "teleport")
-                    self.tele[pad] = cur
         elif tr.is_confused and not prev_confused:
             # Only label confusion on actual trap entry (transition not-confused -> confused);
             # merely passing through a cell while under ongoing confusion must not tag it.
@@ -652,17 +669,37 @@ class Agent:
         else:
             if self.known.get(cur) == "death":
                 self.known[cur] = "free"   # fire rotated away -- cell safe now
-            elif self.known.get(cur) != "confusion":
+            elif self.known.get(cur) not in ("confusion", "teleport"):
                 self.known.setdefault(cur, "free")
-            # Push pad: record the pad cell as a teleport edge so BFS routes
-            # through it correctly on future plans (prevents push-loop: agent
-            # plans through a "free" pad, gets displaced, replans through same pad).
-            if tr.pushed and tr.wall_hits == 0 and not prev_confused:
+
+            if tr.wall_hits == 0 and not prev_confused:
                 dx, dy = DELTAS.get(action, (0, 0))
-                pad    = (prev[0] + dx, prev[1] + dy)
-                if 0 <= pad[0] < GRID and 0 <= pad[1] < GRID:
-                    self.known.setdefault(pad, "teleport")
-                    self.tele[pad] = cur
+                stepped = (prev[0] + dx, prev[1] + dy)   # cell agent physically entered
+
+                if tr.pushed and not tr.teleported:
+                    # Push pad only: stepped onto push pad, got displaced to cur.
+                    # Record push pad -> cur so BFS treats it as a teleport edge.
+                    if 0 <= stepped[0] < GRID and 0 <= stepped[1] < GRID:
+                        self.known.setdefault(stepped, "teleport")
+                        self.tele[stepped] = cur
+
+                elif tr.teleported and not tr.pushed:
+                    # Teleport only: stepped onto teleport pad, jumped to cur.
+                    self.known.setdefault(cur, "teleport")
+                    if 0 <= stepped[0] < GRID and 0 <= stepped[1] < GRID:
+                        self.known.setdefault(stepped, "teleport")
+                        self.tele[stepped] = cur
+
+                elif tr.pushed and tr.teleported:
+                    # Push pad then teleport: agent stepped onto push pad (stepped),
+                    # was displaced to an intermediate cell, then teleported to cur.
+                    # We can't observe the intermediate directly, but the net effect
+                    # for BFS is: entering stepped -> end up at cur.
+                    # Record push pad as a teleport edge with the final destination.
+                    self.known.setdefault(cur, "teleport")
+                    if 0 <= stepped[0] < GRID and 0 <= stepped[1] < GRID:
+                        self.known.setdefault(stepped, "teleport")
+                        self.tele[stepped] = cur
 
         # Record confirmed traversable edge. An actually-walked cardinal step proves
         # the edge is wall-free in BOTH directions (walls are symmetric), so record
@@ -1056,8 +1093,8 @@ def main():
     # 4 -- Extra credit: maze-gamma (push-pad hazards)
     # Gamma's true path (275 steps) goes east/right, so goal_ward MD bias is
     # helpful here.  Keep the original approach but also pre-explore blank layout.
-    agent_gpre = transfer(agent_train, eps=0.5)
-    agent_gpre.goal_ward = True   # gamma path goes east; bias exploration toward goal
+    agent_gpre = transfer(agent_train, eps=EPS_START)
+    agent_gpre.goal_ward = False  # eps=1.0 = pure random frontier; no Q exploitation, no goal bias
     run_phase(MAZE_GAMMA_BLANK, agent_gpre, PRETRAIN_EPISODES,
               train=False, label="MAZE-GAMMA  Pre-explore (blank)", explore=True)
 
