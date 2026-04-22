@@ -53,6 +53,7 @@ UP, RIGHT, DOWN, LEFT, WAIT = 0, 1, 2, 3, 4
 N_ACTIONS = 5
 DELTAS  = {UP:(0,-1), RIGHT:(1,0), DOWN:(0,1), LEFT:(-1,0), WAIT:(0,0)}
 REVERSE = {UP:DOWN, DOWN:UP, LEFT:RIGHT, RIGHT:LEFT, WAIT:WAIT}
+_DELTA_TO_DIR = {(0,-1):UP, (1,0):RIGHT, (0,1):DOWN, (-1,0):LEFT}  # constant lookup
 
 _HERE           = Path(__file__).resolve().parent
 MAZE_ALPHA_BLANK = _HERE / "Contexts/maze-alpha/MAZE_0.png"
@@ -188,9 +189,10 @@ def _detect_hazards(px_arr, h, w) -> dict:
             tp[b] = a          # sphere b -> square a
         elif b_sq and not a_sq:
             tp[a] = b          # sphere a -> square b
-        else:
+        elif not a_sq and not b_sq:
             tp[a] = b          # both spheres: bidirectional
             tp[b] = a
+        # both squares: degenerate -- skip (no valid teleport)
 
     tp = {}
     if len(green)       >= 2: _add_pair(green[0],       green[1])
@@ -414,7 +416,10 @@ class MazeEnv:
             xi = min(max(0, int(round(rx))), self._w - 1)
             yi = min(max(0, int(round(ry))), self._h - 1)
             active.append(px_to_cell(xi, yi, self._cs))
-        self._fire = frozenset(active)
+        # Strip teleport/confusion cells from rotated fire -- rotation can map fire
+        # pixels onto pad cells that share similar hue, causing phantom lethality.
+        _non_fire = self._conf_cells | set(self._tele.keys()) | set(self._tele.values())
+        self._fire = frozenset(c for c in active if c not in _non_fire)
 
 
 # ════════════════════════════════════════════════════════
@@ -429,11 +434,17 @@ def bfs(known: dict, start: tuple, goal: tuple,
     If passable is provided, only traverses confirmed-passable edges.
     Returns path list (start...goal), or [] if unreachable.
     """
-    if start not in known:
+    # start not in known means it has never been visited -- no edges to expand from.
+    # Allow start even if absent from known (agent is already there; also needed in
+    # passable-mode where gap cells aren't in known). Also allow start even if it is
+    # in danger (agent is standing on a rotating-fire cell -- plan FROM there, just
+    # don't route THROUGH other dangerous cells).
+    if start not in known and passable is None:
         return []
     # Local bindings avoid repeated global lookups in the hot loop.
     _known = known; _danger = danger; _blocked = blocked; _passable = passable
     queue = deque([start])
+    # Exclude start from danger check: agent is already standing there.
     came: dict = {start: None}
     q_append = queue.append
     while queue:
@@ -448,11 +459,17 @@ def bfs(known: dict, start: tuple, goal: tuple,
         cx, cy = cur
         for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
             nb = (cx + dx, cy + dy)
-            if nb in came or nb not in _known or nb in _danger:
+            if nb in came or nb in _danger:
                 continue
             if (cur, nb) in _blocked:
                 continue
-            if _passable is not None and (cur, nb) not in _passable:
+            if _passable is not None:
+                # Passable-gated: allow traversal through confirmed edges even if
+                # nb is not yet in known (gap cells in the map).
+                if (cur, nb) not in _passable:
+                    continue
+            elif nb not in _known:
+                # No passable gate: restrict to known cells only.
                 continue
             came[nb] = cur
             q_append(nb)
@@ -487,6 +504,7 @@ class Agent:
         self.passable   : set   = set()   # (from_cell, to_cell) confirmed traversable
         self.danger     : set   = set()   # cells lethal at current rotation slot
         self.rot_danger : dict  = {0:set(), 1:set(), 2:set(), 3:set()}
+        self.conf_cells : set   = set()   # confusion trap cells (cached; avoids dict scan each turn)
         self.tele       : dict  = {}   # pad -> dest (inferred)
         self.goal       : Optional[tuple] = None
         self.start      : Optional[tuple] = None
@@ -501,9 +519,11 @@ class Agent:
         self._ep_deaths: int   = 0
         self._ep_turns : int   = 0
         self._ep_tc    : int   = 0    # turn count within episode (drives fire rotation)
+        self._rot_slot_cache: int = -1  # last computed rotation slot; avoids redundant set copy
 
         # BFS plan cache -- invalidated on death/teleport/push or when path is consumed
         self._plan      : list  = []   # cached step sequence toward goal/frontier
+        self._wait_count: int   = 0    # consecutive WAITs issued; breaks infinite wait loops
 
     def reset_episode(self, start: tuple):
         self._pos       = start
@@ -514,6 +534,8 @@ class Agent:
         self._ep_turns  = 0
         self._ep_tc     = 0
         self._plan      = []
+        self._wait_count = 0
+        self._rot_slot_cache = -1
         if self.start is None:
             self.start = start
         self.known.setdefault(start, "free")
@@ -527,61 +549,77 @@ class Agent:
         return (self._ep_tc // 5) % 4
 
     def _sync_danger(self):
-        self.danger = set(self.rot_danger[self._rot_slot()])
+        slot = (self._ep_tc // 5) % 4
+        if slot != self._rot_slot_cache:
+            self.danger = set(self.rot_danger[slot])
+            self._rot_slot_cache = slot
 
     # ── Action selection ──────────────────────────────────────────────────────
     def choose(self, pos: tuple) -> int:
         self._sync_danger()
 
         if random.random() < self.epsilon:
-            # Exploration: immediate frontier move, or random.
-            # Never run expensive BFS during exploration.
             fa = self._frontier_actions(pos)
             return random.choice(fa) if fa else random.randint(0, N_ACTIONS - 1)
 
-        # Follow cached plan: cleared on death/teleport/push/fire-rotation into path.
+        # Follow cached plan; invalidate if next step is now dangerous.
         if self._plan:
             nxt = self._plan[0]
             if nxt not in self.danger:
                 self._plan.pop(0)
                 return self._dir(pos, nxt)
-            self._plan = []   # fire rotated into cached path
+            self._plan = []   # fire rotated into cached path -- replan
 
-        # Phase 2: goal known -> BFS to goal, cache remaining path.
+        # Phase 2: goal known -> BFS to goal.
         if self.goal is not None and self.goal in self.known:
-            conf_cells = {c for c, v in self.known.items() if v == "confusion"}
+            conf_cells = self.conf_cells   # pre-maintained set; no dict scan needed
+            known = self.known
+            blocked = self.blocked
+            tele = self.tele
+            passable = self.passable
+
+            # Build safe sub-map that always includes pos so BFS can start even
+            # when agent is standing on a rotating-fire cell.
+            def _safe(avoid_set):
+                d = {k: v for k, v in known.items() if k not in avoid_set}
+                if pos in known:
+                    d[pos] = known[pos]
+                return d
+
             if self.goal_ward:
-                always_danger = (self.rot_danger[0] & self.rot_danger[1] &
-                                 self.rot_danger[2] & self.rot_danger[3])
-                avoid = always_danger | conf_cells
-                safe = {k: v for k, v in self.known.items() if k not in avoid}
-                path = bfs(safe, pos, self.goal, avoid, self.blocked, self.tele)
-                if not path:
-                    path = bfs(self.known, pos, self.goal, conf_cells, self.blocked, self.tele)
+                always_on = (self.rot_danger[0] & self.rot_danger[1] &
+                             self.rot_danger[2] & self.rot_danger[3])
+                avoid = always_on | conf_cells
+                path = (bfs(_safe(avoid), pos, self.goal, avoid, blocked, tele) or
+                        bfs(known, pos, self.goal, conf_cells, blocked, tele) or
+                        bfs(known, pos, self.goal, conf_cells, set(), tele) or
+                        bfs(known, pos, self.goal, set(), set(), tele))
             else:
-                avoid = self.danger | conf_cells
-                safe = {k: v for k, v in self.known.items() if k not in avoid}
-                path = bfs(safe, pos, self.goal, avoid, self.blocked, self.tele, self.passable)
-                if not path and self.passable:
-                    path = bfs(safe, pos, self.goal, avoid, self.blocked, self.tele)
-                if not path:
-                    always_on = (self.rot_danger[0] & self.rot_danger[1] &
-                                 self.rot_danger[2] & self.rot_danger[3])
-                    avoid_ao = always_on | conf_cells
-                    always_safe = {k: v for k, v in self.known.items() if k not in avoid_ao}
-                    path = bfs(always_safe, pos, self.goal, avoid_ao, self.blocked, self.tele, self.passable)
-                    if not path and self.passable:
-                        path = bfs(always_safe, pos, self.goal, avoid_ao, self.blocked, self.tele)
-                    if not path:
-                        path = bfs(self.known, pos, self.goal, conf_cells, self.blocked, self.tele)
+                always_on = (self.rot_danger[0] & self.rot_danger[1] &
+                             self.rot_danger[2] & self.rot_danger[3])
+                avoid    = self.danger | conf_cells
+                avoid_ao = always_on  | conf_cells
+                path = (bfs(_safe(avoid), pos, self.goal, avoid, blocked, tele, passable) or
+                        (bfs(_safe(avoid), pos, self.goal, avoid, blocked, tele) if passable else []) or
+                        bfs(_safe(avoid_ao), pos, self.goal, avoid_ao, blocked, tele, passable) or
+                        (bfs(_safe(avoid_ao), pos, self.goal, avoid_ao, blocked, tele) if passable else []) or
+                        bfs(known, pos, self.goal, conf_cells, blocked, tele) or
+                        bfs(known, pos, self.goal, conf_cells, set(), tele) or
+                        bfs(known, pos, self.goal, set(), set(), tele))
+
             if len(path) > 1:
                 nxt = path[1]
-                if nxt in self.danger:
-                    return WAIT
-                self._plan = path[2:]   # cache steps after nxt
+                # Fire-dodge: WAIT if next step is rotating fire (not always-on).
+                # Cap consecutive WAITs at 20 to prevent infinite wait loops.
+                if nxt in self.danger and self._wait_count < 20:
+                    if nxt not in always_on:
+                        self._wait_count += 1
+                        return WAIT
+                self._wait_count = 0
+                self._plan = path[2:]
                 return self._dir(pos, nxt)
 
-        # Phase 1: goal unknown -> BFS to nearest frontier, cache path.
+        # Phase 1: goal unknown -> BFS to nearest frontier.
         fc, unk = self._nearest_frontier(pos)
         if fc is not None:
             if fc == pos and unk is not None:
@@ -595,9 +633,7 @@ class Agent:
         return random.choice(fa) if fa else random.randint(0, N_ACTIONS - 1)
 
     def _dir(self, a: tuple, b: tuple) -> int:
-        dx, dy = b[0] - a[0], b[1] - a[1]
-        return {(0,-1):UP, (1,0):RIGHT, (0,1):DOWN, (-1,0):LEFT}.get(
-            (dx, dy), random.randint(0, 3))
+        return _DELTA_TO_DIR.get((b[0]-a[0], b[1]-a[1]), random.randint(0, 3))
 
     def _frontier_actions(self, pos: tuple) -> list:
         cx, cy = pos
@@ -632,20 +668,18 @@ class Agent:
                     continue
                 visited.add(nb)
                 if nb not in self.known:
-                    # Goal-ward bias: pull exploration toward goal in zero-shot phases
-                    # where the agent has no pre-built passable map. Disabled during
-                    # trained phases (alpha) to preserve broad map coverage.
                     if self.goal_ward and self.goal is not None:
                         md = abs(nb[0] - self.goal[0]) + abs(nb[1] - self.goal[1])
+                        frontier.append((md, hop[cur] + 1, cur, nb))
                     else:
-                        md = 0
-                    frontier.append((md, hop[cur] + 1, cur, nb))
+                        # No goal-ward bias: first frontier found (BFS order = closest)
+                        return cur, nb
                 elif nb not in self.danger and self.known[nb] != "wall":
                     hop[nb] = hop[cur] + 1
                     queue.append(nb)
             if cur in self.tele:
                 dest = self.tele[cur]
-                if dest not in visited and dest in self.known and dest not in self.danger:
+                if dest not in visited and dest not in self.danger:
                     visited.add(dest)
                     hop[dest] = hop[cur] + 1
                     queue.append(dest)
@@ -670,8 +704,12 @@ class Agent:
         self._sync_danger()
         rot = self._rot_slot()
 
-        if tr.is_dead or tr.teleported or tr.pushed:
-            self._plan = []   # position jumped unexpectedly -- cached path is stale
+        # Invalidate plan on any event that can desync expected position or path safety.
+        if tr.is_dead or tr.teleported or tr.pushed or tr.wall_hits or tr.is_confused:
+            self._plan = []
+        # Reset wait counter whenever agent actually moves.
+        if not tr.is_dead and tr.wall_hits == 0:
+            self._wait_count = 0
 
         if tr.is_dead:
             # Fire-pit inference is only reliable when the intended action direction
@@ -705,6 +743,7 @@ class Agent:
             # Only label confusion on actual trap entry (transition not-confused -> confused);
             # merely passing through a cell while under ongoing confusion must not tag it.
             self.known[cur] = "confusion"
+            self.conf_cells.add(cur)
         else:
             if self.known.get(cur) == "death":
                 self.known[cur] = "free"   # fire rotated away -- cell safe now
@@ -813,21 +852,26 @@ def transfer(src: Agent, eps: float, same_maze: bool = False) -> Agent:
     dst.epsilon    = eps
 
     if same_maze:
+        # Remap transient cell labels: "death" may have rotated away (safe now),
+        # "confusion" is a permanent trap so keep it to continue avoiding it.
         dst.known      = {k: ("free" if v == "death" else v)
                           for k, v in src.known.items()}
         dst.goal       = src.goal
         dst.start      = src.start
         dst.tele       = dict(src.tele)
         dst.passable   = set(src.passable)
+        dst.conf_cells = set(src.conf_cells)
         dst.blocked    = set()          # reset wall hits; passable is canonical
         dst.best_path  = list(src.best_path)
         dst.best_turns = src.best_turns
+        dst._plan       = []            # never carry a stale plan across episodes
+        dst._wait_count = 0
     else:
         # Carry goal/start so BFS knows where to aim even before re-discovering goal.
         # All three mazes share the same start/goal cell coordinates.
         dst.goal  = src.goal
         dst.start = src.start
-        # known, passable, blocked, tele stay empty (Agent() defaults)
+        # known, passable, blocked, tele, conf_cells stay empty (Agent() defaults)
 
     dst.danger     = set()
     dst.rot_danger = {0:set(), 1:set(), 2:set(), 3:set()}
