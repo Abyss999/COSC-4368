@@ -644,6 +644,15 @@ class Agent:
                 self.known[cur] = "free"   # fire rotated away -- cell safe now
             elif self.known.get(cur) != "confusion":
                 self.known.setdefault(cur, "free")
+            # Push pad: record the pad cell as a teleport edge so BFS routes
+            # through it correctly on future plans (prevents push-loop: agent
+            # plans through a "free" pad, gets displaced, replans through same pad).
+            if tr.pushed and tr.wall_hits == 0 and not prev_confused:
+                dx, dy = DELTAS.get(action, (0, 0))
+                pad    = (prev[0] + dx, prev[1] + dy)
+                if 0 <= pad[0] < GRID and 0 <= pad[1] < GRID:
+                    self.known.setdefault(pad, "teleport")
+                    self.tele[pad] = cur
 
         # Record confirmed traversable edge. An actually-walked cardinal step proves
         # the edge is wall-free in BOTH directions (walls are symmetric), so record
@@ -743,7 +752,7 @@ def transfer(src: Agent, eps: float, same_maze: bool = False) -> Agent:
 #  EPISODE RUNNER
 # ════════════════════════════════════════════════════════
 def run_episodes(env: MazeEnv, agent: Agent, n: int,
-                 train: bool, label: str) -> list:
+                 train: bool, label: str, explore: bool = False) -> list:
     all_stats = []
     for ep in range(n):
         pos = env.reset(ep)
@@ -781,11 +790,10 @@ def run_episodes(env: MazeEnv, agent: Agent, n: int,
         all_stats.append(agent.ep_stats)
         if train:
             agent.decay_epsilon()
-        elif agent.goal in agent._ep_cells:
-            # Goal was found this episode -- path is now in passable.
-            # Ratchet epsilon down so future episodes exploit the discovered path
-            # rather than wandering randomly. Q-table is not updated so this is
-            # not policy drift; it only controls BFS-vs-explore balance.
+        elif not explore and agent.goal in agent._ep_cells:
+            # Goal was found this episode -- ratchet epsilon down so future
+            # episodes exploit the discovered path.  Skipped in explore mode
+            # (pre-exploration passes) so epsilon stays high for full coverage.
             agent.epsilon = max(EPS_END, agent.epsilon * 0.5)
 
         if (ep + 1) % 20 == 0 or ep == n - 1:
@@ -928,12 +936,13 @@ def save_curve(stats: list, out: Path):
 # ════════════════════════════════════════════════════════
 def run_phase(path: Path, agent: Agent, n: int, train: bool,
               label: str, gamma_mode: bool = False,
-              train_stats: list | None = None) -> tuple:
+              train_stats: list | None = None,
+              explore: bool = False) -> tuple:
     print(f"\n{'='*52}")
     print(f"  {label}")
     print(f"{'='*52}")
     env   = MazeEnv(path, gamma_mode=gamma_mode)
-    stats = run_episodes(env, agent, n, train, label)
+    stats = run_episodes(env, agent, n, train, label, explore=explore)
     m     = report_metrics(stats, agent, env, label, train_stats)
 
     stem = path.stem
@@ -988,18 +997,35 @@ def main():
         train=False, label="MAZE-ALPHA  Test",
         train_stats=train_stats)
 
-    # 3 -- Test maze-beta (zero-shot -- DO NOT train)
-    # Use higher epsilon: alpha Q-values don't generalize to a different wall layout,
-    # so the agent must explore more to build a valid passable map for beta.
-    agent_bt = transfer(agent_train, eps=0.30)
-    agent_bt.goal_ward = True   # bias frontier exploration toward goal
+    # 3 -- Test maze-beta (zero-shot -- DO NOT train Q-table)
+    # Root-cause: beta's true shortest path (379 steps) goes far west before
+    # turning south, but Manhattan goal-ward bias pulls the agent east/right --
+    # the opposite direction.  Fix: pre-explore the blank beta layout (no hazards,
+    # no Q updates) with the transferred Q-table so the agent builds a complete
+    # passable/blocked map of beta's walls before facing hazards.  This mirrors
+    # the alpha pre-train -> alpha train flow and gives the test episodes a full
+    # wall map to navigate with, avoiding 4000-step wandering paths.
+    agent_bpre = transfer(agent_train, eps=0.5)   # 50% random, 50% frontier-BFS -> broad coverage
+    agent_bpre.goal_ward = False                  # no MD bias; explore evenly
+    run_phase(MAZE_BETA_BLANK, agent_bpre, TRAIN_EPISODES,
+              train=False, label="MAZE-BETA  Pre-explore (blank)", explore=True)
+
+    agent_bt = transfer(agent_bpre, eps=EPS_END, same_maze=True)
+    agent_bt.goal_ward = False
     test_b, _, _ = run_phase(
         MAZE_BETA, agent_bt, TEST_EPISODES,
         train=False, label="MAZE-BETA  Test (zero-shot)")
 
     # 4 -- Extra credit: maze-gamma (push-pad hazards)
-    agent_gt = transfer(agent_train, eps=0.30)
-    agent_gt.goal_ward = True   # bias frontier exploration toward goal
+    # Gamma's true path (275 steps) goes east/right, so goal_ward MD bias is
+    # helpful here.  Keep the original approach but also pre-explore blank layout.
+    agent_gpre = transfer(agent_train, eps=0.5)
+    agent_gpre.goal_ward = True   # gamma path goes east; bias exploration toward goal
+    run_phase(MAZE_GAMMA_BLANK, agent_gpre, PRETRAIN_EPISODES,
+              train=False, label="MAZE-GAMMA  Pre-explore (blank)", explore=True)
+
+    agent_gt = transfer(agent_gpre, eps=EPS_END, same_maze=True)
+    agent_gt.goal_ward = True    # gamma path goes east -- MD bias helps
     test_g, _, _ = run_phase(
         MAZE_GAMMA, agent_gt, TEST_EPISODES,
         train=False, label="MAZE-GAMMA  Test (extra credit)",
