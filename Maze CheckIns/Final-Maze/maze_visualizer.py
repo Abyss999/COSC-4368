@@ -1,644 +1,346 @@
 """
-maze_visualizer.py  ·  Unified per-phase visualization  (MP4 edition)
+maze_visualizer.py  ·  COSC 4368 AI  ·  Group 5  (v2 patch)
 
-Key changes from GIF version:
-  · Output is .mp4 (H.264 via cv2.VideoWriter) instead of .gif
-  · Frames are streamed directly to the video writer -- no temp file, no
-    in-memory list.  Peak RAM = one frame at a time (O(1)).
-  · Base image is still downscaled to VIZ_MAX_DIM before rendering.
-  · Rich debug HUD:
-      - Episode / timestep counter
-      - Agent (x, y) position
-      - Last action taken (name)
-      - Step reward + cumulative episode reward
-      - Current epsilon
-      - Optional Q-value arrows (best action per cell in agent's known map)
-  · Hazard overlays on the base image:
-      - Fire / death-pit cells: red-orange tint + "🔥" label
-      - Teleport pad cells: colour-coded outlines matching pad pairs
-      - Confusion trap cells: purple tint
-  · Controls (all in VizConfig):
-      - fps           : output video FPS (default 20)
-      - episode_stride: record every Nth episode (default 1 = all)
-      - last_k_steps  : if >0, only record the last K steps of each episode
-      - pause_on_end  : insert N duplicate frames at episode end (simulates pause)
-  · Headless-safe: cv2.VideoWriter uses the mp4v FOURCC; no GUI is opened.
-  · Fallback: if cv2 is unavailable, falls back to PIL-based GIF (with warning).
+Changes from maze_visualizer (FX9 version)
+-------------------------------------------
+V2-FX4 (visualizer side): The visualizer draws fire using
+env.current_fire, which is a frozenset of cell coords already
+updated by env.step().  No change needed in the visualizer for
+V2-FX4 — the env now calls _rotate_fire(turns%4) instead of
+(turns//5)%4, so current_fire is always current.  The visualizer
+just reads it, so it stays in sync automatically.
 
-Public API (hook contract unchanged from GIF version):
-  class PhaseVisualizer
-    begin_phase(label)
-    begin_episode(env, agent, ep_idx)
-    step(pos, action=None, reward=0.0)
-    end_episode(success)
-    flush(agent, env)
+All FX9 changes retained: fire overlay reads env.current_fire
+(cell coords) directly without any intermediate pixel conversion.
 """
 from __future__ import annotations
 
-import io
-import os
-import warnings
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, List, Tuple, Dict
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 
-# ── Optional cv2 import ───────────────────────────────────────────────────────
 try:
-    import cv2
-    _CV2_OK = True
+    import imageio
+    _HAS_IMAGEIO = True
 except ImportError:
-    _CV2_OK = False
-    warnings.warn(
-        "[maze_visualizer] opencv-python not found. "
-        "Falling back to GIF output. Install with: pip install opencv-python",
-        stacklevel=2,
-    )
+    _HAS_IMAGEIO = False
 
-# ════════════════════════════════════════════════════════
-#  DOWNSCALE LIMIT
-# ════════════════════════════════════════════════════════
-VIZ_MAX_DIM: int = 512   # longest side of rendered frames
+try:
+    import cv2 as _cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
 
-def _maybe_downscale(arr: np.ndarray) -> np.ndarray:
-    h, w = arr.shape[:2]
-    longest = max(h, w)
-    if longest <= VIZ_MAX_DIM:
-        return arr
-    scale = VIZ_MAX_DIM / longest
-    nw = max(1, int(round(w * scale)))
-    nh = max(1, int(round(h * scale)))
-    img = Image.fromarray(arr, "RGB").resize((nw, nh), Image.BICUBIC)
-    return np.array(img)
+UP, RIGHT, DOWN, LEFT, WAIT = 0, 1, 2, 3, 4
+_ACTION_NAMES = {UP: "UP", RIGHT: "RIGHT", DOWN: "DOWN",
+                 LEFT: "LEFT", WAIT: "WAIT"}
 
-# ════════════════════════════════════════════════════════
-#  ACTION NAMES (for HUD)
-# ════════════════════════════════════════════════════════
-_ACTION_NAMES = {0: "UP", 1: "RIGHT", 2: "DOWN", 3: "LEFT", 4: "WAIT", None: "---"}
+_C_AGENT    = (  0, 220, 255)
+_C_PATH_NEW = (255, 160,  20)
+_C_PATH_OLD = ( 60,  25,   0)
+_C_FIRE     = (255,  50,   0)
+_C_HUD_BG   = ( 18,  18,  18)
+_C_HUD_FG   = (210, 210, 210)
+_C_SUCCESS  = ( 40, 255, 100)
+_C_FAIL     = (255,  80,  60)
+_C_NEUTRAL  = (180, 180, 180)
 
-# ════════════════════════════════════════════════════════
-#  CONFIG
-# ════════════════════════════════════════════════════════
+
 @dataclass
 class VizConfig:
-    enabled:            bool  = True
-    # Sampling
-    step_stride:        int   = 2        # render every Nth step within an episode
-    frames_per_episode: int   = 150      # hard cap per episode (uniform downsample)
-    episode_stride:     int   = 1        # record every Nth episode (1 = all)
-    last_k_steps:       int   = 0        # if >0, only keep last K steps per episode
-    replay_frames:      int   = 80       # best-path replay at end of phase
-    pause_on_end:       int   = 15       # duplicate frames at episode end (simulates pause)
-    # Video output
-    fps:                int   = 20
-    out_path:           Path  = Path("Results/training_progress.mp4")
-    # Overlays
-    show_q_arrows:      bool  = False    # draw best-action arrows on known cells
-    show_hazards:       bool  = True     # tint fire/conf/teleport cells on base
-    # Style
-    agent_rgb:          Tuple = (30,  120, 255)
-    path_rgb:           Tuple = (220, 20,  40)
-    best_rgb:           Tuple = (255, 0,   220)
-    path_thickness:     int   = 2
-    best_thickness:     int   = 4
-    # HUD
-    hud_height:         int   = 90       # pixels reserved at bottom for HUD panel
+    enabled           : bool           = True
+    step_stride       : int            = 2
+    frames_per_episode: int            = 120
+    episode_stride    : int            = 1
+    replay_frames     : int            = 80
+    pause_on_end      : int            = 15
+    fps               : int            = 20
+    out_path          : Optional[Path] = None
+    show_q_arrows     : bool           = False
+    show_hazards      : bool           = True
+    hud_height        : int            = 90
 
 
-# ════════════════════════════════════════════════════════
-#  COORDINATE HELPERS
-# ════════════════════════════════════════════════════════
-def _cell_center_scaled(cell: Tuple[int, int], cs: int,
-                        scale: float) -> Tuple[int, int]:
-    cx, cy = cell
-    return (int(round((cx * cs + cs // 2) * scale)),
-            int(round((cy * cs + cs // 2) * scale)))
-
-# ════════════════════════════════════════════════════════
-#  BASE IMAGE  (immutable, with hazard tints baked in)
-# ════════════════════════════════════════════════════════
-# Teleport pair colours (cycle through these for up to 4 pairs)
-_TELE_COLORS = [
-    (0,   200,  80),    # green
-    (200, 100, 255),    # purple
-    (255, 200,  30),    # yellow
-    (255,  60,  60),    # red
-]
-
-def _build_base(env, agent, cfg: VizConfig) -> Tuple[np.ndarray, float]:
-    """
-    Build a downscaled, read-only base image that has:
-      • start marker (green ring)
-      • goal marker  (gold diamond)
-      • hazard tints baked in (fire=red-orange, conf=purple, teleport=coloured outlines)
-    Returns (base_rgb_readonly, pixel_scale).
-    """
-    raw   = env.pixels_copy()
-    small = _maybe_downscale(raw)
-    h_orig, w_orig = raw.shape[:2]
-    h_new,  w_new  = small.shape[:2]
-    scale = h_new / h_orig
-
-    img  = Image.fromarray(small, "RGB")
-    draw = ImageDraw.Draw(img, "RGBA")
-    cs   = env.cs
-    R    = max(3, int(round((cs // 2) * scale)))
-
-    if cfg.show_hazards:
-        # ── Fire / death-pit cells (agent.rot_danger[0] == initial slot) ────
-        fire_cells = set()
-        for slot_set in agent.rot_danger.values():
-            fire_cells |= slot_set
-        # Also include anything currently tagged "death" in known map
-        fire_cells |= {c for c, v in agent.known.items() if v == "death"}
-        for (cx, cy) in fire_cells:
-            px, py = _cell_center_scaled((cx, cy), cs, scale)
-            r2 = max(2, int(round((cs // 2 - 1) * scale)))
-            draw.ellipse([px-r2, py-r2, px+r2, py+r2],
-                         fill=(255, 80, 0, 120))
-
-        # ── Confusion trap cells ─────────────────────────────────────────────
-        for (cx, cy), v in agent.known.items():
-            if v == "confusion":
-                px, py = _cell_center_scaled((cx, cy), cs, scale)
-                r2 = max(2, int(round((cs // 2 - 1) * scale)))
-                draw.rectangle([px-r2, py-r2, px+r2, py+r2],
-                               fill=(160, 0, 220, 100))
-
-        # ── Teleport pad cells (colour-coded by pair index) ──────────────────
-        tele_items = list(agent.tele.items())
-        # group into pairs by destination
-        seen: Dict[tuple, int] = {}
-        pair_idx = 0
-        for src, dst in tele_items:
-            key = tuple(sorted([src, dst]))
-            if key not in seen:
-                seen[key] = pair_idx % len(_TELE_COLORS)
-                pair_idx += 1
-            color = _TELE_COLORS[seen[key]]
-            for cell in (src, dst):
-                px, py = _cell_center_scaled(cell, cs, scale)
-                r2 = max(2, int(round((cs // 2 - 1) * scale)))
-                draw.ellipse([px-r2, py-r2, px+r2, py+r2],
-                             outline=color + (255,), width=max(1, int(round(2*scale))))
-
-    # ── Start marker (green ring) ────────────────────────────────────────────
-    sx, sy = _cell_center_scaled(env.start, cs, scale)
-    draw.ellipse([sx-R, sy-R, sx+R, sy+R],
-                 outline=(30, 220, 80, 255),
-                 width=max(1, int(round(3*scale))))
-
-    # ── Goal marker (gold diamond) ───────────────────────────────────────────
-    gx, gy = _cell_center_scaled(env.goal, cs, scale)
-    draw.polygon([(gx, gy-R), (gx+R, gy), (gx, gy+R), (gx-R, gy)],
-                 outline=(255, 215, 0, 255), fill=(255, 215, 0, 200))
-
-    arr = np.array(img.convert("RGB"))
-    arr.setflags(write=False)
-    return arr, scale
-
-
-# ════════════════════════════════════════════════════════
-#  Q-VALUE ARROWS  (optional overlay)
-# ════════════════════════════════════════════════════════
-_ARROW_DX = {0: 0, 1: 1, 2: 0, 3: -1, 4: 0}
-_ARROW_DY = {0: -1, 1: 0, 2: 1, 3: 0, 4: 0}
-
-def _draw_q_arrows(draw: ImageDraw.ImageDraw, agent, cs: int, scale: float):
-    """Draw a small arrow on each known free cell pointing to the greedy action."""
-    r = max(1, int(round((cs // 3) * scale)))
-    for (cx, cy), v in agent.known.items():
-        if v not in ("free", "goal"):
-            continue
-        q_row = agent.q[cx, cy, 0]   # non-confused state
-        best  = int(np.argmax(q_row))
-        if q_row[best] <= 0:
-            continue
-        px, py = _cell_center_scaled((cx, cy), cs, scale)
-        ex = px + int(round(_ARROW_DX[best] * r))
-        ey = py + int(round(_ARROW_DY[best] * r))
-        draw.line([px, py, ex, ey], fill=(255, 255, 100, 180), width=1)
-        draw.ellipse([ex-1, ey-1, ex+1, ey+1], fill=(255, 255, 100, 200))
-
-
-# ════════════════════════════════════════════════════════
-#  PATH DRAWING
-# ════════════════════════════════════════════════════════
-def _draw_polyline(draw, cells, cs, color, thickness, scale):
-    pts = [_cell_center_scaled(c, cs, scale) for c in cells]
-    for i in range(1, len(pts)):
-        draw.line([pts[i-1], pts[i]], fill=color, width=max(1, thickness))
-    r = max(1, thickness // 2)
-    for x, y in pts:
-        draw.ellipse([x-r, y-r, x+r, y+r], fill=color)
-
-
-# ════════════════════════════════════════════════════════
-#  HUD PANEL
-# ════════════════════════════════════════════════════════
-def _draw_hud(img: Image.Image, cfg: VizConfig,
-              ep_idx: int, step_idx: int,
-              pos: Tuple[int, int],
-              action: Optional[int],
-              reward: float, cum_reward: float,
-              epsilon: float,
-              success_flag: Optional[bool] = None) -> Image.Image:
-    """
-    Append a solid black HUD panel below the maze frame with all debug info.
-    Returns a new image (original + panel).
-    """
-    W, H   = img.size
-    ph     = cfg.hud_height
-    canvas = Image.new("RGB", (W, H + ph), (0, 0, 0))
-    canvas.paste(img, (0, 0))
-    draw   = ImageDraw.Draw(canvas)
-
-    # Two rows of text
-    lines = [
-        (f"EP {ep_idx:>4}  STEP {step_idx:>5}  POS ({pos[0]:>2},{pos[1]:>2})  "
-         f"ACT {_ACTION_NAMES.get(action, '---'):<5}  EPS {epsilon:.3f}"),
-        (f"REWARD {reward:>+7.1f}  CUM {cum_reward:>+8.1f}  "
-         f"MAP {len([v for v in [None]])or 0}"),
-    ]
-    # Overwrite line 2 with actual map size
-    map_sz = sum(1 for v in getattr(_hud_agent_ref, "known", {}).values()
-                 if v != "wall") if _hud_agent_ref else 0
-    lines[1] = (f"REWARD {reward:>+7.1f}  CUM {cum_reward:>+8.1f}  "
-                f"MAP {map_sz} cells")
-
-    if success_flag is not None:
-        status = "✓ GOAL" if success_flag else "✗ TIMEOUT"
-        lines[0] += f"  [{status}]"
-
-    y0 = H + 6
-    for line in lines:
-        draw.text((8, y0), line, fill=(220, 220, 220))
-        y0 += 18
-
-    # Colour bar at top of HUD (green=success, red=fail, grey=running)
-    if success_flag is True:
-        bar_color = (0, 200, 80)
-    elif success_flag is False:
-        bar_color = (200, 50, 50)
-    else:
-        bar_color = (80, 80, 80)
-    draw.rectangle([0, H, W, H+3], fill=bar_color)
-
-    return canvas
-
-# Module-level mutable ref so _draw_hud can access agent.known size
-# (avoids threading issues -- we're single-threaded anyway)
-_hud_agent_ref = None
-
-
-# ════════════════════════════════════════════════════════
-#  FRAME COMPOSER
-# ════════════════════════════════════════════════════════
-def _compose_frame(base_rgb: np.ndarray, env, agent, scale: float,
-                   pos: Tuple[int, int],
-                   full_path: List[Tuple[int, int]],
-                   best_path: Optional[List[Tuple[int, int]]],
-                   highlight_best: bool,
-                   ep_idx: int, step_idx: int,
-                   action: Optional[int],
-                   reward: float, cum_reward: float,
-                   cfg: VizConfig,
-                   success_flag: Optional[bool] = None) -> np.ndarray:
-    """
-    Compose one frame as a numpy uint8 array (H+hud_height, W, 3) in RGB order.
-    """
-    frame = base_rgb.copy()
-    img   = Image.fromarray(frame, "RGB")
-    draw  = ImageDraw.Draw(img)
-    cs    = env.cs
-
-    # Path trail
-    if full_path and len(full_path) >= 2:
-        _draw_polyline(draw, full_path, cs, cfg.path_rgb, cfg.path_thickness, scale)
-
-    # Best-path replay
-    if highlight_best and best_path:
-        _draw_polyline(draw, best_path, cs, cfg.best_rgb, cfg.best_thickness, scale)
-
-    # Q arrows (optional)
-    if cfg.show_q_arrows and not highlight_best:
-        _draw_q_arrows(draw, agent, cs, scale)
-
-    # Agent dot
-    ar = max(3, int(round((cs // 2 - 1) * scale)))
-    ax, ay = _cell_center_scaled(pos, cs, scale)
-    draw.ellipse([ax-ar, ay-ar, ax+ar, ay+ar],
-                 fill=cfg.agent_rgb, outline=(255, 255, 255),
-                 width=max(1, int(round(2*scale))))
-
-    # HUD panel
-    img = _draw_hud(img, cfg, ep_idx, step_idx, pos, action,
-                    reward, cum_reward, agent.epsilon, success_flag)
-
-    return np.array(img)
-
-
-# ════════════════════════════════════════════════════════
-#  VIDEO WRITER WRAPPER
-# ════════════════════════════════════════════════════════
-class _VideoWriter:
-    """
-    Thin wrapper around cv2.VideoWriter (or PIL GIF fallback).
-    Streams frames directly to disk -- no in-memory accumulation.
-    """
-
-    def __init__(self, path: Path, fps: int, frame_hw: Tuple[int, int]):
-        self._path  = path
-        self._fps   = fps
-        self._hw    = frame_hw   # (height, width)
-        self._writer = None
-        self._gif_frames: Optional[List] = None   # fallback only
-        self._use_cv2 = _CV2_OK
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._open()
-
-    def _open(self):
-        h, w = self._hw
-        if self._use_cv2:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self._writer = cv2.VideoWriter(
-                str(self._path), fourcc, self._fps, (w, h)
-            )
-            if not self._writer.isOpened():
-                warnings.warn(
-                    f"[viz] cv2.VideoWriter failed to open {self._path}. "
-                    "Falling back to GIF.", stacklevel=3
-                )
-                self._use_cv2 = False
-                self._gif_frames = []
-        else:
-            self._gif_frames = []
-
-    def write(self, frame_rgb: np.ndarray):
-        """Accept an RGB uint8 numpy array."""
-        if self._use_cv2:
-            bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            self._writer.write(bgr)
-        else:
-            self._gif_frames.append(Image.fromarray(frame_rgb))
-
-    def close(self) -> Path:
-        if self._use_cv2 and self._writer is not None:
-            self._writer.release()
-            print(f"    [viz] MP4 saved -> {self._path.name}")
-            return self._path
-        # GIF fallback
-        if self._gif_frames:
-            gif_path = self._path.with_suffix(".gif")
-            pal = [f.convert("P", palette=Image.ADAPTIVE, colors=128)
-                   for f in self._gif_frames]
-            dur  = max(20, int(1000 / max(1, self._fps)))
-            pal[0].save(gif_path, save_all=True, append_images=pal[1:],
-                        duration=dur, loop=0, optimize=True, disposal=2)
-            mb = gif_path.stat().st_size / (1024*1024)
-            print(f"    [viz] GIF fallback saved -> {gif_path.name} "
-                  f"({len(pal)} frames, {mb:.2f} MB)")
-            return gif_path
-        return self._path
-
-
-# ════════════════════════════════════════════════════════
-#  SEPARATOR FRAME
-# ════════════════════════════════════════════════════════
-def _make_separator_frame(base_rgb: np.ndarray, banner: str,
-                          hud_height: int) -> np.ndarray:
-    """Dimmed maze + centred banner text + blank HUD strip."""
-    frame  = (base_rgb.copy().astype(np.uint16) * 45 // 100).astype(np.uint8)
-    img    = Image.fromarray(frame, "RGB")
-    draw   = ImageDraw.Draw(img)
-    W, H   = img.size
-    box_w  = 7 * len(banner) + 24
-    x0     = (W - box_w) // 2
-    y0     = H // 2 - 16
-    draw.rectangle([x0, y0, x0+box_w, y0+28],
-                   fill=(0,0,0), outline=(255,255,255), width=2)
-    draw.text((x0+12, y0+9), banner, fill=(255,255,255))
-    # Append blank HUD strip so dimensions match
-    canvas = Image.new("RGB", (W, H + hud_height), (0,0,0))
-    canvas.paste(img, (0,0))
-    return np.array(canvas)
-
-
-# ════════════════════════════════════════════════════════
-#  PHASE VISUALIZER  (public API -- hook contract unchanged)
-# ════════════════════════════════════════════════════════
 class PhaseVisualizer:
     """
-    One PhaseVisualizer = one output video file.
+    Records one MP4 for a complete training/test phase.
 
-    Hook points (same as GIF version):
-        viz.begin_phase(label)
-        viz.begin_episode(env, agent, ep_idx)
-        viz.step(pos, action=None, reward=0.0)   ← action + reward are NEW optional args
-        viz.end_episode(success)
-        viz.flush(agent, env)
-
-    The old viz.step(pos) signature still works; action/reward default to None/0.
+    Fire overlay reads env.current_fire (frozenset of cell coords)
+    directly.  Because the env now rotates fire every turn (V2-FX4),
+    current_fire is always the correct set for the current step.
+    No pixel conversion needed — the visualizer draws disks at
+    (cx*cs + cs//2, cy*cs + cs//2) for each (cx,cy) in the set.
     """
 
-    def __init__(self, cfg: Optional[VizConfig] = None):
-        self.cfg = cfg or VizConfig()
-        self.cfg.out_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, cfg: VizConfig):
+        self._cfg   = cfg
+        self._label = ""
+        self._frames: List[np.ndarray] = []
 
-        self._label:      str  = ""
-        self._writer:     Optional[_VideoWriter] = None
-        self._frame_hw:   Optional[Tuple[int, int]] = None
+        self._ep_idx       : int   = 0
+        self._ep_step      : int   = 0
+        self._ep_frame_cnt : int   = 0
+        self._ep_path: List[Optional[Tuple[int, int]]] = []
+        self._ep_reward    : float = 0.0
+        self._ep_deaths    : int   = 0
+        self._last_action  : int   = WAIT
 
-        # Per-episode state
-        self._env         = None
-        self._agent       = None
-        self._base_rgb:   Optional[np.ndarray]      = None
-        self._scale:      float                     = 1.0
-        self._ep_idx:     int                       = 0
-        self._step_idx:   int                       = 0
-        self._full_path:  List[Tuple[int, int]]     = []
-        self._ep_frames:  List[np.ndarray]          = []  # buffer for ONE episode
-        self._last_action: Optional[int]            = None
-        self._last_reward: float                    = 0.0
-        self._cum_reward:  float                    = 0.0
+        self._pos: Tuple[int, int] = (0, 0)
 
-    # ── phase hooks ──────────────────────────────────────────────────────────
-    def begin_phase(self, label: str):
-        if not self.cfg.enabled:
-            return
+        self._base_img: Optional[np.ndarray] = None
+        self._cs       : int = 16
+        self._env_ref        = None
+
+        self._active = False
+
+    def begin_phase(self, label: str) -> None:
         self._label  = label
-        self._writer = None   # writer opened on first frame (need frame size first)
+        self._frames = []
+        self._active = True
 
-    def begin_episode(self, env, agent, ep_idx: int):
-        if not self.cfg.enabled:
-            return
-        global _hud_agent_ref
-        _hud_agent_ref  = agent
+    def begin_episode(self, env, agent, ep_idx: int = 0) -> None:
+        self._ep_idx       = ep_idx
+        self._ep_step      = 0
+        self._ep_frame_cnt = 0
+        self._ep_path      = []
+        self._ep_reward    = 0.0
+        self._ep_deaths    = 0
+        self._last_action  = WAIT
+        self._env_ref      = env
+        self._cs           = env.cs
 
-        self._env        = env
-        self._agent      = agent
-        self._ep_idx     = ep_idx
-        self._step_idx   = 0
-        self._full_path  = [env.start]
-        self._ep_frames  = []
-        self._last_action = None
-        self._last_reward = 0.0
-        self._cum_reward  = 0.0
+        self._base_img = env.pixels_copy()
 
-        self._base_rgb, self._scale = _build_base(env, agent, self.cfg)
-        self._capture(env.start)
+        self._pos = env.start
+        self._ep_path.append(env.start)
 
-    def step(self, pos: Tuple[int, int],
-             action: Optional[int] = None,
-             reward: float = 0.0):
-        if not self.cfg.enabled:
-            return
-        self._step_idx   += 1
-        self._last_action = action
-        self._last_reward = reward
-        self._cum_reward += reward
-        self._full_path.append(pos)
-
-        if (self._step_idx % self.cfg.step_stride) != 0:
+    def step(self,
+             pos    : tuple,
+             action : int   = WAIT,
+             reward : float = 0.0,
+             is_dead: bool  = False) -> None:
+        if not self._active:
             return
 
-        # last_k_steps mode: only keep a rolling window
-        self._capture(pos)
-        if self.cfg.last_k_steps > 0:
-            keep = self.cfg.last_k_steps // max(1, self.cfg.step_stride)
-            if len(self._ep_frames) > keep:
-                self._ep_frames = self._ep_frames[-keep:]
+        self._last_action  = action
+        self._ep_reward   += reward
+        self._ep_step     += 1
 
-    def end_episode(self, success: bool):
-        if not self.cfg.enabled:
+        if is_dead:
+            self._ep_path.append(None)
+            self._ep_deaths += 1
+
+        self._ep_path.append(pos)
+        self._pos = pos
+
+        if self._ep_idx % max(1, self._cfg.episode_stride) != 0:
             return
-        if self._full_path:
-            self._capture(self._full_path[-1], success_flag=success)
-
-        # Downsample episode frames to budget
-        ep_frames = _uniform_sample(self._ep_frames, self.cfg.frames_per_episode)
-
-        # Skip recording if episode_stride says so
-        if self._ep_idx % self.cfg.episode_stride != 0:
-            self._ep_frames = []
+        if self._ep_frame_cnt >= self._cfg.frames_per_episode:
+            return
+        if self._ep_step % max(1, self._cfg.step_stride) != 0:
             return
 
-        # Lazy-init the video writer (we now know frame dimensions)
-        if ep_frames and self._writer is None:
-            h, w = ep_frames[0].shape[:2]
-            self._frame_hw = (h, w)
-            out = self._resolve_path()
-            self._writer = _VideoWriter(out, self.cfg.fps, (h, w))
+        self._ep_frame_cnt += 1
+        self._frames.append(
+            self._render_frame(f"Ep {self._ep_idx + 1}  Step {self._ep_step}"))
 
-        if self._writer is not None:
-            for f in ep_frames:
-                self._writer.write(f)
-            # Pause frames
-            if ep_frames:
-                pause = _make_separator_frame(
-                    self._base_rgb,
-                    f"EP {self._ep_idx}  {'SOLVED' if success else 'TIMEOUT'}",
-                    self.cfg.hud_height,
-                )
-                for _ in range(self.cfg.pause_on_end):
-                    self._writer.write(pause)
-
-        self._ep_frames = []
-
-    def flush(self, agent, env):
-        if not self.cfg.enabled:
+    def end_episode(self, success: bool) -> None:
+        if not self._active:
             return
-        if self._writer is None:
-            print(f"    [viz] no frames recorded for phase '{self._label}'")
+        if self._ep_idx % max(1, self._cfg.episode_stride) != 0:
+            return
+        colour = _C_SUCCESS if success else _C_FAIL
+        txt    = "SUCCESS!" if success else "FAILED"
+        for _ in range(self._cfg.pause_on_end):
+            self._frames.append(
+                self._render_frame(
+                    f"Ep {self._ep_idx + 1}  {txt}",
+                    overlay_text=txt, overlay_color=colour))
+
+    def flush(self, agent=None, env=None) -> None:
+        if not self._active or not self._frames:
+            self._active = False
+            return
+        out = self._cfg.out_path
+        if out is None:
+            self._active = False
+            return
+        out = Path(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        n = len(self._frames)
+        print(f"    Writing {n} frames -> {out.name} ...", end=" ", flush=True)
+        try:
+            self._write_mp4(out, self._frames)
+            print("done.")
+        except Exception as ex:
+            print(f"\n    MP4 failed ({ex}), trying GIF ...")
+            gif = out.with_suffix(".gif")
+            try:
+                self._write_gif(gif, self._frames)
+                print(f"    Saved GIF -> {gif.name}")
+            except Exception as ex2:
+                print(f"    GIF also failed: {ex2}")
+        self._frames = []
+        self._active = False
+
+    def _render_frame(self,
+                      label        : str   = "",
+                      overlay_text : str   = "",
+                      overlay_color: tuple = _C_NEUTRAL) -> np.ndarray:
+        """
+        Fire cells come directly from env.current_fire (frozenset of
+        cell coordinates, already at the correct rotation for this step).
+        Draws a disk at (cx*cs + cs//2, cy*cs + cs//2) for each cell.
+        """
+        cfg = self._cfg
+        if self._base_img is None:
+            return np.zeros((64 + cfg.hud_height, 64, 3), dtype=np.uint8)
+
+        base = self._base_img.copy()
+        h, w = base.shape[:2]
+        cs   = self._cs
+
+        # Fire overlay — cell-space coordinates → pixel center
+        if cfg.show_hazards and self._env_ref is not None:
+            try:
+                fire_cells = self._env_ref.current_fire   # frozenset of (cx, cy)
+                r_f = max(1, cs // 2 - 1)
+                side = 2 * r_f + 1
+                yy, xx = np.mgrid[-r_f:r_f+1, -r_f:r_f+1]
+                disk = (xx * xx + yy * yy) <= r_f * r_f
+                fire_rgb = np.array(_C_FIRE, dtype=np.int32)
+                for (cx, cy) in fire_cells:
+                    fpx = cx * cs + cs // 2
+                    fpy = cy * cs + cs // 2
+                    y0, y1 = fpy - r_f, fpy + r_f + 1
+                    x0, x1 = fpx - r_f, fpx + r_f + 1
+                    dy0 = max(0, -y0); dy1 = side - max(0, y1 - h)
+                    dx0 = max(0, -x0); dx1 = side - max(0, x1 - w)
+                    y0 = max(0, y0); y1 = min(h, y1)
+                    x0 = max(0, x0); x1 = min(w, x1)
+                    if y0 >= y1 or x0 >= x1:
+                        continue
+                    patch_disk = disk[dy0:dy1, dx0:dx1]
+                    region = base[y0:y1, x0:x1]
+                    blended = (region.astype(np.int32) + fire_rgb) >> 1
+                    region[patch_disk] = np.clip(blended, 0, 255).astype(np.uint8)[patch_disk]
+            except Exception:
+                pass
+
+        # Path trail
+        dot_r = max(1, cs // 8)
+        side_d = 2 * dot_r + 1
+        yy_d, xx_d = np.mgrid[-dot_r:dot_r+1, -dot_r:dot_r+1]
+        disk_d = (xx_d * xx_d + yy_d * yy_d) <= dot_r * dot_r
+        valid = [p for p in self._ep_path if p is not None]
+        n_pts = len(valid)
+
+        for i, pt in enumerate(valid[:-1]):
+            recency = i / max(1, n_pts - 2)
+            r_c = int(_C_PATH_OLD[0] + (_C_PATH_NEW[0] - _C_PATH_OLD[0]) * recency)
+            g_c = int(_C_PATH_OLD[1] + (_C_PATH_NEW[1] - _C_PATH_OLD[1]) * recency)
+            b_c = int(_C_PATH_OLD[2] + (_C_PATH_NEW[2] - _C_PATH_OLD[2]) * recency)
+            ppx = pt[0] * cs + cs // 2
+            ppy = pt[1] * cs + cs // 2
+            y0, y1 = ppy - dot_r, ppy + dot_r + 1
+            x0, x1 = ppx - dot_r, ppx + dot_r + 1
+            dy0 = max(0, -y0); dy1 = side_d - max(0, y1 - h)
+            dx0 = max(0, -x0); dx1 = side_d - max(0, x1 - w)
+            y0 = max(0, y0); y1 = min(h, y1)
+            x0 = max(0, x0); x1 = min(w, x1)
+            if y0 >= y1 or x0 >= x1:
+                continue
+            mask = disk_d[dy0:dy1, dx0:dx1]
+            base[y0:y1, x0:x1][mask] = [r_c, g_c, b_c]
+
+        # Agent dot
+        ax, ay = self._pos
+        apx = ax * cs + cs // 2
+        apy = ay * cs + cs // 2
+        ar  = max(2, cs // 3)
+        side_a = 2 * ar + 1
+        yy_a, xx_a = np.mgrid[-ar:ar+1, -ar:ar+1]
+        disk_a = (xx_a * xx_a + yy_a * yy_a) <= ar * ar
+        y0, y1 = apy - ar, apy + ar + 1
+        x0, x1 = apx - ar, apx + ar + 1
+        dy0 = max(0, -y0); dy1 = side_a - max(0, y1 - h)
+        dx0 = max(0, -x0); dx1 = side_a - max(0, x1 - w)
+        y0 = max(0, y0); y1 = min(h, y1)
+        x0 = max(0, x0); x1 = min(w, x1)
+        if y0 < y1 and x0 < x1:
+            mask_a = disk_a[dy0:dy1, dx0:dx1]
+            base[y0:y1, x0:x1][mask_a] = list(_C_AGENT)
+
+        maze_pil = Image.fromarray(base)
+        total_h  = h + cfg.hud_height
+        full     = Image.new("RGB", (w, total_h), color=_C_HUD_BG)
+        full.paste(maze_pil, (0, 0))
+
+        draw = ImageDraw.Draw(full)
+        hx, hy = 8, h + 5
+        lh = 18
+        draw.text((hx, hy),          f"Phase: {self._label}",        fill=_C_HUD_FG)
+        draw.text((hx, hy + lh),     label,                           fill=_C_HUD_FG)
+        draw.text((hx, hy + lh * 2), f"Pos: {self._pos}  "
+                                      f"Act: {_ACTION_NAMES.get(self._last_action,'?')}",
+                                      fill=_C_HUD_FG)
+        draw.text((hx, hy + lh * 3), f"Reward: {self._ep_reward:+.1f}  "
+                                      f"Deaths: {self._ep_deaths}",
+                                      fill=_C_HUD_FG)
+
+        if overlay_text:
+            cw  = len(overlay_text) * 8
+            bx0 = w // 2 - cw // 2 - 6
+            bx1 = w // 2 + cw // 2 + 6
+            by0 = h // 2 - 14
+            by1 = h // 2 + 14
+            draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0))
+            draw.text((w // 2 - cw // 2, h // 2 - 10),
+                      overlay_text, fill=overlay_color)
+
+        return np.array(full, dtype=np.uint8)
+
+    def _write_mp4(self, path: Path, frames: list) -> None:
+        if _HAS_IMAGEIO:
+            try:
+                import imageio
+                with imageio.get_writer(
+                    str(path),
+                    fps=self._cfg.fps,
+                    codec="libx264",
+                    output_params=["-pix_fmt", "yuv420p"],
+                ) as wrt:
+                    for f in frames:
+                        wrt.append_data(f.astype(np.uint8))
+                return
+            except Exception:
+                pass
+
+        if _HAS_CV2:
+            import cv2
+            fh, fw = frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            vw     = cv2.VideoWriter(str(path), fourcc, self._cfg.fps, (fw, fh))
+            for f in frames:
+                vw.write(cv2.cvtColor(f.astype(np.uint8), cv2.COLOR_RGB2BGR))
+            vw.release()
             return
 
-        # Best-path replay
-        if agent.best_path and len(agent.best_path) >= 2:
-            base_replay, replay_scale = _build_base(env, agent, self.cfg)
-            h_r, w_r = base_replay.shape[:2]
-            fh = h_r + self.cfg.hud_height
-            # intro separator
-            intro = _make_separator_frame(
-                base_replay,
-                f"BEST PATH  {len(agent.best_path)} cells",
-                self.cfg.hud_height,
-            )
-            for _ in range(self.cfg.pause_on_end):
-                self._writer.write(intro)
-            # animate
-            bp = list(agent.best_path)
-            n_out = min(self.cfg.replay_frames, len(bp))
-            idxs  = np.linspace(0, len(bp)-1, n_out, dtype=int)
-            for i in idxs:
-                prefix = bp[:i+1]
-                frame  = _compose_frame(
-                    base_replay, env, agent, replay_scale,
-                    bp[i], [],
-                    prefix, highlight_best=True,
-                    ep_idx=self._ep_idx, step_idx=i,
-                    action=None, reward=0.0, cum_reward=0.0,
-                    cfg=self.cfg,
-                )
-                self._writer.write(frame)
-
-        self._writer.close()
-        self._writer = None
-
-    # ── internals ────────────────────────────────────────────────────────────
-    def _capture(self, pos: Tuple[int, int],
-                 success_flag: Optional[bool] = None):
-        if self._base_rgb is None:
-            return
-        frame = _compose_frame(
-            self._base_rgb, self._env, self._agent, self._scale,
-            pos, self._full_path,
-            None, False,
-            self._ep_idx, self._step_idx,
-            self._last_action, self._last_reward, self._cum_reward,
-            self.cfg, success_flag,
+        raise RuntimeError(
+            "No MP4 backend available.  "
+            "Install `imageio` + `imageio-ffmpeg`, or `opencv-python`."
         )
-        self._ep_frames.append(frame)
 
-    def _resolve_path(self) -> Path:
-        """Return output path, embedding phase label if user left the default."""
-        out = self.cfg.out_path
-        if out == VizConfig().out_path:
-            safe = self._label.replace(" ", "_").replace("/", "_")
-            out  = out.parent / f"{safe}.mp4"
-        return out
-
-
-# ════════════════════════════════════════════════════════
-#  HELPERS
-# ════════════════════════════════════════════════════════
-def _uniform_sample(items: List, target: int) -> List:
-    if target <= 0 or len(items) <= target:
-        return list(items)
-    idx = np.linspace(0, len(items)-1, target, dtype=int)
-    return [items[i] for i in idx]
-
-
-# ════════════════════════════════════════════════════════
-#  LEGACY GIF HELPERS  (kept so any code importing them still works)
-# ════════════════════════════════════════════════════════
-def append_episode_frames(frames_out, episode_frames,
-                          separator=None, separator_count=0):
-    frames_out.extend(episode_frames)
-    if separator is not None and separator_count > 0:
-        frames_out.extend([separator] * separator_count)
-
-def save_training_gif(frames, out_path: Path, fps: int = 20):
-    if not frames:
-        print(f"    [viz] save_training_gif: no frames -> {out_path.name}")
-        return
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    dur = max(20, int(1000 / max(1, fps)))
-    pal = [f.convert("P", palette=Image.ADAPTIVE, colors=128) for f in frames]
-    pal[0].save(out_path, save_all=True, append_images=pal[1:],
-                duration=dur, loop=0, optimize=True, disposal=2)
-    mb = out_path.stat().st_size / (1024*1024)
-    print(f"    [viz] GIF saved -> {out_path.name} ({len(frames)} frames, {mb:.2f} MB)")
-
-# ── VizConfig alias for backwards compat ──────────────────────────────────────
-# Old code that passes gif_fps= will just get it ignored gracefully.
+    def _write_gif(self, path: Path, frames: list) -> None:
+        pil_frames = [Image.fromarray(f.astype(np.uint8)) for f in frames]
+        dur = max(20, 1000 // max(1, self._cfg.fps))
+        pil_frames[0].save(
+            str(path),
+            save_all=True,
+            append_images=pil_frames[1:],
+            loop=0,
+            duration=dur,
+            optimize=False,
+        )
