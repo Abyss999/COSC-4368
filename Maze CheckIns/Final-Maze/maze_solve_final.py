@@ -23,16 +23,16 @@ from typing import Optional
 #  SETTINGS  <- change freely
 # ════════════════════════════════════════════════════════
 DEBUG_MOVE_VALIDATOR = False   # set True to assert every move is legal under env adjacency
-PRETRAIN_EPISODES = 100   # blank maze (MAZE_0) warm-up
+PRETRAIN_EPISODES = 40   # blank maze (MAZE_0) warm-up
 TRAIN_EPISODES = 200
 TEST_EPISODES  = 5
-MAX_TURNS      = 10_000
+MAX_TURNS      = 4000
 
 LR        = 0.1    # Q-learning rate
 GAMMA_RL  = 0.95   # discount factor
 EPS_START = 1.0    # initial exploration rate
-EPS_END   = 0.05   # minimum exploration rate
-EPS_DECAY = 0.95   # epsilon multiplied by this each episode
+EPS_END   = 0.10   # minimum exploration rate
+EPS_DECAY = 0.985  # epsilon multiplied by this each episode
 
 R_GOAL     =  200.0
 R_DEATH    =  -50.0
@@ -163,7 +163,7 @@ def _detect_hazards(px_arr, h, w) -> dict:
     green  = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (g > 170) & (r < 140) & (b < 160), min_sz=30))
     purple = sorted(_clusters(px_arr, h, w,
-        lambda r, g, b: (r > 100) & (r < 210) & (b > 130) & (g < 100), min_sz=30))
+        lambda r, g, b: (b > 140) & (r > 80) & (r < 230) & (b > r) & (b > g + 40), min_sz=30))
     red    = sorted(_clusters(px_arr, h, w,
         lambda r, g, b: (r > 190) & (g < 80) & (b < 80), min_sz=80))
 
@@ -284,7 +284,7 @@ class MazeEnv:
     The agent ONLY receives TurnResult feedback -- never inspects internals.
     """
 
-    def __init__(self, path: Path, gamma_mode: bool = False):
+    def __init__(self, path: Path, gamma_mode: bool = False, flip_start_goal: bool = False):
         px, h, w  = _load_image(path)
         self._px, self._h, self._w = px, h, w
         cs        = _cell_size(w, h)
@@ -296,8 +296,12 @@ class MazeEnv:
         sp, gp = _find_start_goal(px, h, w)
         if not sp or not gp:
             raise ValueError(f"Start/goal not found in {path.name}")
-        self._start = px_to_cell(*sp, cs)
-        self._goal  = px_to_cell(*gp, cs)
+        s_cell = px_to_cell(*sp, cs)
+        g_cell = px_to_cell(*gp, cs)
+        if flip_start_goal:
+            self._start, self._goal = g_cell, s_cell
+        else:
+            self._start, self._goal = s_cell, g_cell
 
         hz = _detect_hazards(px, h, w)
         self._conf_cells  = frozenset(px_to_cell(x, y, cs) for x, y in hz["confusion"])
@@ -320,9 +324,15 @@ class MazeEnv:
 
         self._pos    = self._start
         self._conf   = 0
-        self._turns  = 0          # global turn counter (drives fire rotation)
-        self._fire: frozenset = frozenset()
-        self._rotate_fire(0)
+        self._turns  = 0
+        self._cur_rotation = 0
+
+        # Pre-compute all 4 rotation sets once at init (avoids recomputing each step)
+        _non_fire = self._conf_cells | set(self._tele.keys()) | set(self._tele.values())
+        self._rotation_sets: dict = {}
+        for slot in range(4):
+            self._rotation_sets[slot] = self._compute_rotation_set(slot, _non_fire)
+        self._fire: frozenset = self._rotation_sets[0]
 
         print(f"  {path.name:<20} start={self._start} goal={self._goal} "
               f"cs={cs}px | fire={len(self._base_fire)} "
@@ -339,16 +349,24 @@ class MazeEnv:
     def free_count(self): return self._free_count
 
     def reset(self, ep: int = 0) -> tuple:
-        self._pos   = self._start
-        self._conf  = 0
-        self._turns = 0
-        self._rotate_fire(0)
+        self._pos          = self._start
+        self._conf         = 0
+        self._turns        = 0
+        self._cur_rotation = 0
+        self._fire         = self._rotation_sets[0]
         return self._pos
 
+    def _rotate_deathpits(self):
+        """Advance fire rotation by one slot; incrementally update only changed cells."""
+        next_rot           = (self._cur_rotation + 1) % 4
+        self._fire         = self._rotation_sets[next_rot]
+        self._cur_rotation = next_rot
+
     def step(self, action: int) -> TurnResult:
-        # Advance turn counter and rotate fire every 5 turns (spec requirement)
+        # Rotate fire every 5 turns (spec requirement)
         self._turns += 1
-        self._rotate_fire((self._turns // 5) % 4)
+        if self._turns % 5 == 0:
+            self._rotate_deathpits()
 
         eff = REVERSE[action] if self._conf > 0 else action
         if self._conf > 0:
@@ -403,10 +421,10 @@ class MazeEnv:
 
     def pixels_copy(self): return self._px.copy()
 
-    def _rotate_fire(self, slot: int):
+    def _compute_rotation_set(self, slot: int, non_fire: frozenset) -> frozenset:
+        """Compute the set of active fire cells for a given rotation slot."""
         if not self._base_fire:
-            self._fire = frozenset()
-            return
+            return frozenset()
         ppx, ppy = max(self._base_fire, key=lambda p: p[1])
         active   = []
         for x, y in self._base_fire:
@@ -416,10 +434,7 @@ class MazeEnv:
             xi = min(max(0, int(round(rx))), self._w - 1)
             yi = min(max(0, int(round(ry))), self._h - 1)
             active.append(px_to_cell(xi, yi, self._cs))
-        # Strip teleport/confusion cells from rotated fire -- rotation can map fire
-        # pixels onto pad cells that share similar hue, causing phantom lethality.
-        _non_fire = self._conf_cells | set(self._tele.keys()) | set(self._tele.values())
-        self._fire = frozenset(c for c in active if c not in _non_fire)
+        return frozenset(c for c in active if c not in non_fire)
 
 
 # ════════════════════════════════════════════════════════
@@ -567,7 +582,10 @@ class Agent:
             nxt = self._plan[0]
             if nxt not in self.danger:
                 self._plan.pop(0)
-                return self._dir(pos, nxt)
+                dir_action = self._dir(pos, nxt)
+                q_vals = self.q[pos[0], pos[1], int(self._confused)]
+                best_q = int(np.argmax(q_vals))
+                return dir_action if random.random() < 0.8 else best_q
             self._plan = []   # fire rotated into cached path -- replan
 
         # Phase 2: goal known -> BFS to goal.
@@ -586,38 +604,43 @@ class Agent:
                     d[pos] = known[pos]
                 return d
 
+            always_on = (self.rot_danger[0] & self.rot_danger[1] &
+                         self.rot_danger[2] & self.rot_danger[3])
             if self.goal_ward:
-                always_on = (self.rot_danger[0] & self.rot_danger[1] &
-                             self.rot_danger[2] & self.rot_danger[3])
-                avoid = always_on | conf_cells
-                path = (bfs(_safe(avoid), pos, self.goal, avoid, blocked, tele) or
+                avoid        = always_on | conf_cells
+                safe_avoid   = _safe(avoid)
+                path = (bfs(safe_avoid, pos, self.goal, avoid, blocked, tele) or
                         bfs(known, pos, self.goal, conf_cells, blocked, tele) or
                         bfs(known, pos, self.goal, conf_cells, set(), tele) or
                         bfs(known, pos, self.goal, set(), set(), tele))
             else:
-                always_on = (self.rot_danger[0] & self.rot_danger[1] &
-                             self.rot_danger[2] & self.rot_danger[3])
-                avoid    = self.danger | conf_cells
-                avoid_ao = always_on  | conf_cells
-                path = (bfs(_safe(avoid), pos, self.goal, avoid, blocked, tele, passable) or
-                        (bfs(_safe(avoid), pos, self.goal, avoid, blocked, tele) if passable else []) or
-                        bfs(_safe(avoid_ao), pos, self.goal, avoid_ao, blocked, tele, passable) or
-                        (bfs(_safe(avoid_ao), pos, self.goal, avoid_ao, blocked, tele) if passable else []) or
+                avoid        = self.danger | conf_cells
+                avoid_ao     = always_on  | conf_cells
+                safe_avoid   = _safe(avoid)
+                safe_avoid_ao = _safe(avoid_ao)
+                path = (bfs(safe_avoid, pos, self.goal, avoid, blocked, tele, passable) or
+                        (bfs(safe_avoid, pos, self.goal, avoid, blocked, tele) if passable else []) or
+                        bfs(safe_avoid_ao, pos, self.goal, avoid_ao, blocked, tele, passable) or
+                        (bfs(safe_avoid_ao, pos, self.goal, avoid_ao, blocked, tele) if passable else []) or
                         bfs(known, pos, self.goal, conf_cells, blocked, tele) or
                         bfs(known, pos, self.goal, conf_cells, set(), tele) or
                         bfs(known, pos, self.goal, set(), set(), tele))
 
             if len(path) > 1:
                 nxt = path[1]
-                # Fire-dodge: WAIT if next step is rotating fire (not always-on).
-                # Cap consecutive WAITs at 20 to prevent infinite wait loops.
-                if nxt in self.danger and self._wait_count < 20:
-                    if nxt not in always_on:
+                if nxt in self.danger:
+                    if nxt in always_on or self._wait_count >= 20:
+                        # Permanently blocked or waited too long — replan around it
+                        self._plan = []
+                        self._wait_count = 0
+                    else:
+                        # Rotating fire — wait for it to move away
                         self._wait_count += 1
                         return WAIT
-                self._wait_count = 0
-                self._plan = path[2:]
-                return self._dir(pos, nxt)
+                else:
+                    self._wait_count = 0
+                    self._plan = path[2:]
+                    return self._dir(pos, nxt)
 
         # Phase 1: goal unknown -> BFS to nearest frontier.
         fc, unk = self._nearest_frontier(pos)
@@ -707,8 +730,8 @@ class Agent:
         # Invalidate plan on any event that can desync expected position or path safety.
         if tr.is_dead or tr.teleported or tr.pushed or tr.wall_hits or tr.is_confused:
             self._plan = []
-        # Reset wait counter whenever agent actually moves.
-        if not tr.is_dead and tr.wall_hits == 0:
+        # Reset wait counter only when agent actually changed position (not on WAIT action).
+        if not tr.is_dead and tr.wall_hits == 0 and tr.current_position != prev:
             self._wait_count = 0
 
         if tr.is_dead:
@@ -754,26 +777,9 @@ class Agent:
                 dx, dy = DELTAS.get(action, (0, 0))
                 stepped = (prev[0] + dx, prev[1] + dy)   # cell agent physically entered
 
-                if tr.pushed and not tr.teleported:
-                    # Push pad only: stepped onto push pad, got displaced to cur.
-                    # Record push pad -> cur so BFS treats it as a teleport edge.
-                    if 0 <= stepped[0] < GRID and 0 <= stepped[1] < GRID:
-                        self.known.setdefault(stepped, "teleport")
-                        self.tele[stepped] = cur
-
-                elif tr.teleported and not tr.pushed:
-                    # Teleport only: stepped onto teleport pad, jumped to cur.
-                    self.known.setdefault(cur, "teleport")
-                    if 0 <= stepped[0] < GRID and 0 <= stepped[1] < GRID:
-                        self.known.setdefault(stepped, "teleport")
-                        self.tele[stepped] = cur
-
-                elif tr.pushed and tr.teleported:
-                    # Push pad then teleport: agent stepped onto push pad (stepped),
-                    # was displaced to an intermediate cell, then teleported to cur.
-                    # We can't observe the intermediate directly, but the net effect
-                    # for BFS is: entering stepped -> end up at cur.
-                    # Record push pad as a teleport edge with the final destination.
+                if tr.pushed or tr.teleported:
+                    # Unified: whatever combination of push/teleport occurred,
+                    # the net effect for BFS is stepped -> cur. Record directly.
                     self.known.setdefault(cur, "teleport")
                     if 0 <= stepped[0] < GRID and 0 <= stepped[1] < GRID:
                         self.known.setdefault(stepped, "teleport")
@@ -1093,11 +1099,12 @@ def save_curve(stats: list, out: Path):
 def run_phase(path: Path, agent: Agent, n: int, train: bool,
               label: str, gamma_mode: bool = False,
               train_stats: list | None = None,
-              explore: bool = False) -> tuple:
+              explore: bool = False,
+              flip_start_goal: bool = False) -> tuple:
     print(f"\n{'='*52}")
     print(f"  {label}")
     print(f"{'='*52}")
-    env   = MazeEnv(path, gamma_mode=gamma_mode)
+    env   = MazeEnv(path, gamma_mode=gamma_mode, flip_start_goal=flip_start_goal)
     stats = run_episodes(env, agent, n, train, label, explore=explore)
     m     = report_metrics(stats, agent, env, label, train_stats)
 
@@ -1133,17 +1140,20 @@ def main():
 
     # 0 -- Pre-train on blank maze-alpha (MAZE_0) to learn layout without hazards
     agent_pre = Agent()
+    agent_pre.goal_ward = True   # bias frontier toward goal to find it faster
     _, _, _ = run_phase(
         MAZE_ALPHA_BLANK, agent_pre, PRETRAIN_EPISODES,
-        train=True, label="MAZE-ALPHA  Pre-train (blank)")
+        train=True, label="MAZE-ALPHA  Pre-train (blank)", flip_start_goal=True)
 
     # 1 -- Train on maze-alpha (with hazards), warm-started from pre-training
-    # same_maze=True: MAZE_0 and MAZE_1 share the same wall layout (MAZE_1 adds hazards only)
+    # Keep passable edges from pretrain: MAZE_0 and MAZE_1 share the same wall layout,
+    # so pretrain passable edges are valid. Clearing them causes the agent to lose all
+    # path knowledge and die repeatedly in fire before re-learning routes.
     agent_train = transfer(agent_pre, eps=EPS_START, same_maze=True)
-    agent_train.passable = set()   # re-walk MAZE_1 to build hazard-aware passable edges
+    agent_train.goal_ward = True
     train_stats, _, _ = run_phase(
         MAZE_ALPHA, agent_train, TRAIN_EPISODES,
-        train=True, label="MAZE-ALPHA  Training")
+        train=True, label="MAZE-ALPHA  Training", flip_start_goal=True)
 
     save_curve(train_stats, RESULTS / "learning_curve_alpha.png")
 
@@ -1152,41 +1162,40 @@ def main():
     test_a, _, _ = run_phase(
         MAZE_ALPHA, agent_at, TEST_EPISODES,
         train=False, label="MAZE-ALPHA  Test",
-        train_stats=train_stats)
+        train_stats=train_stats, flip_start_goal=True)
 
-    # 3 -- Test maze-beta (zero-shot -- DO NOT train Q-table)
-    # Root-cause: beta's true shortest path (379 steps) goes far west before
-    # turning south, but Manhattan goal-ward bias pulls the agent east/right --
-    # the opposite direction.  Fix: pre-explore the blank beta layout (no hazards,
-    # no Q updates) with the transferred Q-table so the agent builds a complete
-    # passable/blocked map of beta's walls before facing hazards.  This mirrors
-    # the alpha pre-train -> alpha train flow and gives the test episodes a full
-    # wall map to navigate with, avoiding 4000-step wandering paths.
-    agent_bpre = transfer(agent_train, eps=0.5)   # 50% random, 50% frontier-BFS -> broad coverage
-    agent_bpre.goal_ward = False                  # no MD bias; explore evenly
+    # 3 -- Test maze-beta (zero-shot)
+    # Alpha was flipped (start=bottom, goal=top). Beta is normal (start=top, goal=bottom).
+    # Swap goal/start so the agent aims at the correct beta goal (32,63) not alpha's goal (31,0).
+    agent_bpre = transfer(agent_train, eps=0.5)
+    agent_bpre.goal, agent_bpre.start = agent_bpre.start, agent_bpre.goal  # un-flip for beta
+    agent_bpre.goal_ward = False
     run_phase(MAZE_BETA_BLANK, agent_bpre, TRAIN_EPISODES,
               train=False, label="MAZE-BETA  Pre-explore (blank)", explore=True)
 
     agent_bt = transfer(agent_bpre, eps=EPS_END, same_maze=True)
     agent_bt.goal_ward = False
-    agent_bt.zero_shot = True   # enables danger-ignoring fallback BFS when all safe paths fail
+    agent_bt.zero_shot = True
     test_b, _, _ = run_phase(
         MAZE_BETA, agent_bt, TEST_EPISODES,
         train=False, label="MAZE-BETA  Test (zero-shot)")
 
-    # 4 -- Extra credit: maze-gamma (push-pad hazards)
-    # Gamma's true path (275 steps) goes east/right, so goal_ward MD bias is
-    # helpful here.  Keep the original approach but also pre-explore blank layout.
-    agent_gpre = transfer(agent_train, eps=EPS_START)
-    agent_gpre.goal_ward = False  # eps=1.0 = pure random frontier; no Q exploitation, no goal bias
-    run_phase(MAZE_GAMMA_BLANK, agent_gpre, PRETRAIN_EPISODES,
-              train=False, label="MAZE-GAMMA  Pre-explore (blank)", explore=True)
+    # 4 -- Test maze-gamma (extra credit: push-pad hazards)
+    # Gamma is normal orientation (start=top, goal=bottom), same as beta.
+    # Transfer from alpha_train and un-flip goal/start to match gamma's orientation.
+    agent_gpre = transfer(agent_train, eps=0.5)
+    agent_gpre.goal, agent_gpre.start = agent_gpre.start, agent_gpre.goal  # un-flip for gamma
+    agent_gpre.goal_ward = False
+    run_phase(MAZE_GAMMA_BLANK, agent_gpre, TRAIN_EPISODES,
+              train=False, label="MAZE-GAMMA  Pre-explore (blank)",
+              gamma_mode=True, explore=True)
 
     agent_gt = transfer(agent_gpre, eps=EPS_END, same_maze=True)
-    agent_gt.goal_ward = True    # gamma path goes east -- MD bias helps
+    agent_gt.goal_ward = False
+    agent_gt.zero_shot = True
     test_g, _, _ = run_phase(
         MAZE_GAMMA, agent_gt, TEST_EPISODES,
-        train=False, label="MAZE-GAMMA  Test (extra credit)",
+        train=False, label="MAZE-GAMMA  Test (zero-shot)",
         gamma_mode=True)
 
     # Final summary
@@ -1199,7 +1208,7 @@ def main():
         ("Alpha Train",      train_stats),
         ("Alpha Test",       test_a),
         ("Beta  Test",       test_b),
-        ("Gamma (X-credit)", test_g),
+        ("Gamma Test",       test_g),
     ]:
         succ = [s for s in st if s["success"]]
         SR   = len(succ) / len(st) if st else 0.0
